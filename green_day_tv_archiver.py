@@ -31,15 +31,15 @@ from pathlib import Path
 # Configuration
 # ------------------------------------------------------------
 
-STREAM_URL = "https://www.youtube.com/watch?v=Xu90G4oFq2o"
+STREAM_URL = "https://www.youtube.com/watch?v=Xu90G4oFq2o" # GREEN DAY TV
 
-ARCHIVE_DIR = Path(r"D:\Pietro\Archives\GreenDayTV")
+ARCHIVE_DIR = Path(r"D:\GreenDayTV") # CHANGE THIS TO THE DIRECTORY YOU WANT TO ARCHIVE THE STREAM TO.
 
-SEGMENT_SECONDS = 60 * 60
+SEGMENT_SECONDS = 60 * 60 # Save everything to file every 1 hour (60 seconds * 60 minutes)
 
-FORMAT_ID = "96"
+FORMAT_ID = "96" # Every youtube video quality format has an ID. '96' is the highest-quality available format for GDTV. It may change depending on the stream.
 
-MIN_FREE_GB = 20
+MIN_FREE_GB = 20 # Minimum space (GBs) required on target disk (either main or external, set by ARCHIVE_DIR) to allow archiving.
 
 RETRY_SECONDS = 18
 
