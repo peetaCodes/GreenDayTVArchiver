@@ -4,6 +4,7 @@ import json
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
+import internet_archive_uploader
 
 
 # ============================================================
@@ -14,6 +15,8 @@ from pathlib import Path
 # and then stitched everything together into (hopefully) 24hrs-long daily files.
 #
 # ============================================================
+
+UPLOAD_TO_INTERNET_ARCHIVE = True
 
 ARCHIVE_DIR = Path(r"D:\GreenDayTV") # The directory conaining the archived clips. CHANGE THIS.
 OUTPUT_DIR = ARCHIVE_DIR / "Daily" # The path to store the Daily videos. By default is ARCHIVE_DIR/Daily. Change this if you want
@@ -282,7 +285,7 @@ def concat_parts(parts, output: Path):
                 str(part),
             ])
 
-    reulst = run(command)
+    result = run(command)
     if result.returncode not in (0, 1): raise RuntimeError(f"mkvmerge returned non-zero and non-one status {result.returncode}")
 
 
@@ -410,6 +413,8 @@ def process_day(day, segments: list[dict]):
             is_first_clip = False
 
         concat_parts(parts, output)
+        if UPLOAD_TO_INTERNET_ARCHIVE == True:
+            upload_to_internet_archive(output)
 
     finally:
         for path in work_dir.glob("*"):
