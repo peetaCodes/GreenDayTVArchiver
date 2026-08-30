@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-import os
+import queue
+import re
 import shutil
 import signal
 import socket
@@ -9,52 +10,66 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
+
 """
- ============================================================
- Green Day TV 24/7 Archiver
+============================================================
+Green Day TV 24/7 Archiver
+============================================================
 
- Windows / Python 3.10+
+Architecture:
 
- Architecture:
-
-                  YouTube
-                     │
-                     ▼
-                  yt-dlp
-             format 96 / HLS
-                     │
-                     ▼
-             yt-dlp's FFmpeg
-              HLS downloader
-                     │
-                     │ MPEG-TS
-                     ▼
-             Python TCP relay
-                     │
-                     │ continuous TCP stream
-                     ▼
-                  FFmpeg
-              -c:v copy
-              -c:a copy
-                     │
-                     ▼
-              hourly MKV files
-
- FFmpeg is started once and remains alive.
-
- yt-dlp is periodically restarted so that YouTube's
- short-lived signed HLS URLs never get close to expiring.
-
- No video or audio is ever re-encoded.
- ============================================================
- """
+                         YouTube
+                            │
+                            ▼
+                         yt-dlp
+                     format 96 / HLS
+                            │
+                            ▼
+                  yt-dlp's FFmpeg
+                     HLS downloader
+                            │
+                            │ MPEG-TS
+                            ▼
+                    Python producer
+                         reader
+                            │
+                     bounded queue
+                            │
+                            ▼
+                    Python TCP relay
+                            │
+                            ▼
+                         FFmpeg
+                     stream copy only
+                            │
+                            ▼
+                     hourly MKV files
 
 
+Design goals:
 
+* Never silently accept a dead/stalled producer.
+* Detect persistent 401/403 HLS failures immediately.
+* Restart yt-dlp automatically.
+* Keep FFmpeg alive across producer restarts.
+* Restart FFmpeg automatically if FFmpeg itself fails.
+* Never allow an unbounded RAM queue.
+* Never allow a blocked socket write to hang forever.
+* Periodically verify free disk space.
+* Use stream copy only. No re-encoding.
+* Back off only when YouTube itself is unavailable.
+* Continue forever until explicitly stopped or disk space
+  falls below the configured safety threshold.
 
-
+No program can guarantee zero loss against an external service
+such as YouTube. The purpose of this architecture is instead to
+make failures fail FAST and recover AUTOMATICALLY, minimizing
+the amount of footage lost.
+============================================================
+"""
 
 
 # ------------------------------------------------------------
@@ -65,7 +80,7 @@ from pathlib import Path
 STREAM_URL = "https://www.youtube.com/watch?v=Xu90G4oFq2o"
 
 # Archive destination. CHANGE THIS TO AN ACTUAL PATH (I strongly suggest using an external drive to not fill up/slow down your main drive).
-ARCHIVE_DIR = Path(r"D:\Pietro\Archives\GreenDayTV") 
+ARCHIVE_DIR = Path(r"D:\Archives\GreenDayTV") 
 
 # One new archive file approximately every hour.
 SEGMENT_SECONDS = 60 * 60
@@ -78,128 +93,379 @@ FORMAT_ID = "96"
 MIN_FREE_GB = 10
 
 
-
-
 # ------------------------------------------------------------
-# yt-dlp refresh/watchdog settings
+# Producer watchdog
 # ------------------------------------------------------------
 
-# Proactively replace the YouTube HLS session before its
-# signed URL is likely to expire.
+# Refresh the YouTube session well before a typical signed URL
+# lifetime expires.
 #
-# My previous URL showed approximately six-hour validity.
-# 5.5 hours leaves a good safety margin.
-PRODUCER_REFRESH_SECONDS = 5 * 60 * 60 + 30 * 60
+# This is deliberately conservative. A refresh costs a small
+# amount of footage occasionally, but is much safer than waiting
+# until the signed URL is already near expiry.
+PRODUCER_REFRESH_SECONDS = 4 * 60 * 60 + 30 * 60
 
-# If no bytes have arrived from yt-dlp for this long,
-# consider the producer stalled and restart it.
+
+# Once media has started arriving, this much time without ANY
+# bytes is considered a hard producer failure.
 #
-# The HLS segments themselves are only ~5 seconds long, so
-# 45 seconds without data is (intentionally) very generous.
-PRODUCER_STALL_SECONDS = 45
+# HLS fragments are about 5 seconds here. 12 seconds therefore
+# allows a couple of missed scheduling/network intervals while
+# still reacting quickly.
+PRODUCER_STALL_SECONDS = 12
 
-# Small delay before starting a replacement producer.
+
+# Maximum time allowed to obtain the first media bytes from a
+# freshly started producer.
+PRODUCER_STARTUP_TIMEOUT_SECONDS = 60
+
+
+# A repeated 401/403 condition is treated as fatal for the
+# current signed HLS session.
+#
+# One isolated 403 may be transient.
+# Two within this window strongly indicate that the current
+# HLS session/URL cannot continue successfully.
+HTTP_AUTH_FAILURE_THRESHOLD = 2
+
+HTTP_AUTH_FAILURE_WINDOW_SECONDS = 12
+
+
+# Delay before replacing a failed producer.
 PRODUCER_RESTART_DELAY_SECONDS = 1
 
-# Local TCP relay address. You micht need to change this depending on your location.
-RELAY_HOST = "127.0.0.1"
 
-# Use a high, non-privileged local port.
+# ------------------------------------------------------------
+# yt-dlp retry policy
+# ------------------------------------------------------------
+
+# These are deliberately finite.
+#
+# They are not relied upon as the main watchdog.  The Python
+# supervisor independently detects persistent 401/403 and stalls.
+YTDLP_RETRIES = 2
+YTDLP_FRAGMENT_RETRIES = 2
+
+
+# ------------------------------------------------------------
+# Relay
+# ------------------------------------------------------------
+
+RELAY_HOST = "127.0.0.1"
 RELAY_PORT = 48731
 
-# Size of chunks copied from yt-dlp to the relay.
 RELAY_CHUNK_SIZE = 256 * 1024
 
+QUEUE_MAX_BYTES = 64 * 1024 * 1024
+
+QUEUE_MAX_CHUNKS = max(
+    1,
+    QUEUE_MAX_BYTES // RELAY_CHUNK_SIZE,
+)
+
+
+# socket.sendall() must never be allowed to block forever.
+#
+# This is local loopback communication, so 10 seconds is already
+# extremely generous.
+RELAY_SEND_TIMEOUT_SECONDS = 10
 
 
 # ------------------------------------------------------------
-# Global state
+# Disk monitoring
 # ------------------------------------------------------------
 
-STOP_REQUESTED = False
+DISK_CHECK_INTERVAL_SECONDS = 60
 
 
 # ------------------------------------------------------------
+# FFmpeg / overall supervisor
+# ------------------------------------------------------------
+
+# How long to wait for FFmpeg to establish the relay connection.
+FFMPEG_CONNECT_TIMEOUT_SECONDS = 30
+
+
+# When a complete FFmpeg/relay session has failed, don't hammer
+# the system indefinitely. The delay increases progressively,
+# then remains capped.
+SESSION_BACKOFF_INITIAL_SECONDS = 1
+SESSION_BACKOFF_MAX_SECONDS = 30
+
+
+# ============================================================
+# Global shutdown state
+# ============================================================
+
+STOP_EVENT = threading.Event()
+
+
+# ============================================================
+# HTTP failure detection
+# ============================================================
+
+HTTP_AUTH_ERROR_RE = re.compile(
+    r"HTTP error (401|403)\s",
+    re.IGNORECASE,
+)
+
+
+# ============================================================
+# Producer state
+# ============================================================
+
+class ProducerState:
+
+    def __init__(self):
+
+        self.lock = threading.Lock()
+
+        self.last_data_time = time.monotonic()
+
+        self.bytes_received = 0
+
+        self.eof = False
+
+        self.reader_error = False
+
+        self.reader_error_message = None
+
+        self.fatal_reason = None
+
+        self.http_failures = deque()
+
+        self.start_time = time.monotonic()
+
+
+    def record_data(
+        self,
+        byte_count: int,
+    ):
+
+        now = time.monotonic()
+
+        with self.lock:
+
+            self.last_data_time = now
+
+            self.bytes_received += byte_count
+
+
+    def record_http_failure(
+        self,
+        status_code: str,
+    ):
+
+        now = time.monotonic()
+
+        with self.lock:
+
+            self.http_failures.append(now)
+
+            cutoff = (
+                now
+                - HTTP_AUTH_FAILURE_WINDOW_SECONDS
+            )
+
+            while (
+                self.http_failures
+                and self.http_failures[0] < cutoff
+            ):
+
+                self.http_failures.popleft()
+
+
+            count = len(
+                self.http_failures
+            )
+
+
+            if (
+                count
+                >= HTTP_AUTH_FAILURE_THRESHOLD
+                and self.fatal_reason is None
+            ):
+
+                self.fatal_reason = (
+                    f"repeated HTTP "
+                    f"{status_code} errors "
+                    f"({count} within "
+                    f"{HTTP_AUTH_FAILURE_WINDOW_SECONDS:.0f}s)"
+                )
+
+
+    def set_eof(self):
+
+        with self.lock:
+
+            self.eof = True
+
+
+    def set_reader_error(
+        self,
+        message: str,
+    ):
+
+        with self.lock:
+
+            self.reader_error = True
+
+            self.reader_error_message = (
+                message
+            )
+
+
+    def snapshot(self):
+
+        with self.lock:
+
+            return {
+                "last_data_time": (
+                    self.last_data_time
+                ),
+                "bytes_received": (
+                    self.bytes_received
+                ),
+                "eof": self.eof,
+                "reader_error": (
+                    self.reader_error
+                ),
+                "reader_error_message": (
+                    self.reader_error_message
+                ),
+                "fatal_reason": (
+                    self.fatal_reason
+                ),
+                "start_time": (
+                    self.start_time
+                ),
+            }
+
+
+# ============================================================
 # Signal handling
-# ------------------------------------------------------------
+# ============================================================
 
-def request_stop(signum, frame):
-    global STOP_REQUESTED
+def request_stop(
+    signum,
+    frame,
+):
 
-    STOP_REQUESTED = True
+    if not STOP_EVENT.is_set():
 
-    logging.info("Shutdown requested...")
+        logging.info(
+            "Shutdown requested..."
+        )
+
+        STOP_EVENT.set()
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Disk-space check
-# ------------------------------------------------------------
+# ============================================================
 
 def check_disk_space() -> bool:
+
     ARCHIVE_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    usage = shutil.disk_usage(ARCHIVE_DIR)
+    usage = shutil.disk_usage(
+        ARCHIVE_DIR
+    )
 
-    free_gb = usage.free / (1024 ** 3)
+    free_gb = (
+        usage.free
+        / (1024 ** 3)
+    )
 
     if free_gb < MIN_FREE_GB:
+
         logging.error(
-            "Only %.1f GB remains on the archive SSD. "
+            "Only %.1f GB remains on "
+            "the archive SSD. "
             "Stopping to protect the filesystem.",
             free_gb,
         )
 
         return False
 
+
     return True
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Dependency checks
-# ------------------------------------------------------------
+# ============================================================
 
 def check_dependencies():
+
     if shutil.which("ffmpeg") is None:
+
         logging.error(
             "FFmpeg was not found in PATH."
-        )
-        
-        logging.error(
-            "Install FFmpeg (if not already installed) and add to PATH."
-            "If you don't know how to add something to PATH (or what that even means), please search for any guide online."
         )
 
         sys.exit(1)
 
+
     if shutil.which("deno") is None:
+
         logging.error(
             "Deno was not found in PATH."
         )
 
         logging.error(
-            "Install Deno and open a new terminal before "
-            "starting the archiver."
+            "Install Deno and reopen the terminal."
         )
 
         sys.exit(1)
 
 
-# ------------------------------------------------------------
-# Windows process-tree termination
-# ------------------------------------------------------------
+    try:
 
-def terminate_process_tree(process: subprocess.Popen):
-    """
-    yt-dlp itself launches FFmpeg for HLS downloading.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "yt_dlp",
+                "--version",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=True,
+        )
 
-    On Windows, killing only the yt-dlp process can leave its
-    child FFmpeg process alive.
+        version = result.stdout.strip()
 
-    Therefore we terminate the entire process tree.
-    """
+        logging.info(
+            "yt-dlp version: %s",
+            version,
+        )
+
+    except Exception:
+
+        logging.exception(
+            "Could not execute yt-dlp."
+        )
+
+        sys.exit(1)
+
+
+# ============================================================
+# Process-tree termination
+# ============================================================
+
+def terminate_process_tree(
+    process: subprocess.Popen | None,
+    name: str,
+):
+
+    if process is None:
+        return
 
     if process.poll() is not None:
         return
@@ -207,11 +473,14 @@ def terminate_process_tree(process: subprocess.Popen):
     pid = process.pid
 
     logging.info(
-        "Terminating yt-dlp process tree (PID %s)...",
+        "Terminating %s process tree "
+        "(PID %s)...",
+        name,
         pid,
     )
 
     try:
+
         subprocess.run(
             [
                 "taskkill",
@@ -223,121 +492,235 @@ def terminate_process_tree(process: subprocess.Popen):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            timeout=15,
         )
 
     except Exception:
+
         logging.exception(
-            "Unable to terminate yt-dlp process tree normally."
+            "Unable to terminate %s "
+            "process tree.",
+            name,
         )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # yt-dlp command
-# ------------------------------------------------------------
+# ============================================================
 
 def build_ytdlp_command():
-    """
-    Build the yt-dlp command responsible for obtaining
-    Green Day TV format 96.
-
-    stdout is the MPEG-TS media stream.
-
-    stderr remains available for logging.
-    """
 
     return [
+
         sys.executable,
 
         "-m",
         "yt_dlp",
 
-        # Explicit format 96.
         "-f",
         FORMAT_ID,
 
-        # FFmpeg is the HLS downloader.
+        # Use FFmpeg for live HLS.
         "--downloader",
         "ffmpeg",
 
-        # Produce MPEG-TS rather than attempting to create
-        # a normal completed output file.
+        # Ensure MPEG-TS is used while streaming.
         "--hls-use-mpegts",
 
-        # Retry network/fragment failures indefinitely.
-        #
-        # The watchdog below handles pathological hangs.
+        # Finite retries.
         "--retries",
-        "infinite",
+        str(YTDLP_RETRIES),
 
         "--fragment-retries",
-        "infinite",
+        str(YTDLP_FRAGMENT_RETRIES),
 
-        # Don't buffer a completed output file; write the
-        # downloaded media to stdout.
+        "--retry-sleep",
+        "fragment:1",
+
+        # FFmpeg network read/write timeout.
+        #
+        # This complements the Python watchdog.  It prevents
+        # an FFmpeg HTTP operation itself from hanging forever.
+        "--downloader-args",
+        "ffmpeg:-rw_timeout 15000000",
+
+        "--no-playlist",
+
+        # MPEG-TS to stdout.
         "-o",
         "-",
 
-        # This is one livestream, never a playlist.
-        "--no-playlist",
-
-        # The stream URL.
         STREAM_URL,
     ]
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Producer stderr reader
-# ------------------------------------------------------------
+# ============================================================
 
-def read_producer_stderr(
+def producer_stderr_reader(
     process: subprocess.Popen,
     producer_number: int,
+    state: ProducerState,
 ):
-    """
-    Continuously copy yt-dlp/FFmpeg downloader diagnostics
-    into the main archive log.
-
-    This runs in a background thread because stdout is being
-    used for the actual MPEG-TS media data.
-    """
 
     if process.stderr is None:
         return
 
+
     try:
+
         for raw_line in iter(
             process.stderr.readline,
             b"",
         ):
-            if STOP_REQUESTED:
-                break
 
             if not raw_line:
                 break
+
 
             line = raw_line.decode(
                 "utf-8",
                 errors="replace",
             ).rstrip()
 
-            if line:
-                logging.info(
-                    "[yt-dlp #%d] %s",
-                    producer_number,
-                    line,
+
+            if not line:
+                continue
+
+
+            # ------------------------------------------------
+            # Watch for authentication/signed-URL failures.
+            #
+            # This is the critical difference from the old
+            # implementation.
+            # ------------------------------------------------
+
+            match = HTTP_AUTH_ERROR_RE.search(
+                line
+            )
+
+            if match:
+
+                status_code = match.group(1)
+
+                state.record_http_failure(
+                    status_code
                 )
 
+
+            logging.info(
+                "[yt-dlp #%d] %s",
+                producer_number,
+                line,
+            )
+
+
     except Exception:
-        logging.exception(
-            "Producer stderr reader failed."
-        )
+
+        if not STOP_EVENT.is_set():
+
+            logging.exception(
+                "yt-dlp stderr reader failed "
+                "for producer #%d.",
+                producer_number,
+            )
 
 
-# ------------------------------------------------------------
-# Start yt-dlp producer
-# ------------------------------------------------------------
+# ============================================================
+# Producer stdout reader
+# ============================================================
 
-def start_producer(producer_number: int):
+def producer_stdout_reader(
+    process: subprocess.Popen,
+    data_queue: queue.Queue,
+    producer_number: int,
+    state: ProducerState,
+):
+
+    if process.stdout is None:
+        return
+
+
+    try:
+
+        while not STOP_EVENT.is_set():
+
+            data = process.stdout.read(
+                RELAY_CHUNK_SIZE
+            )
+
+
+            if not data:
+
+                logging.warning(
+                    "yt-dlp producer #%d "
+                    "reached EOF.",
+                    producer_number,
+                )
+
+                state.set_eof()
+
+                return
+
+
+            # IMPORTANT:
+            #
+            # Record receipt of actual media BEFORE queue.put().
+            #
+            # This prevents the watchdog from incorrectly thinking
+            # the producer stopped producing merely because the
+            # relay queue is temporarily full.
+            state.record_data(
+                len(data)
+            )
+
+
+            # ------------------------------------------------
+            # Bounded queue.
+            #
+            # Never allow unlimited RAM growth.
+            # ------------------------------------------------
+
+            while not STOP_EVENT.is_set():
+
+                try:
+
+                    data_queue.put(
+                        data,
+                        timeout=0.5,
+                    )
+
+                    break
+
+                except queue.Full:
+
+                    continue
+
+
+    except Exception as exc:
+
+        if not STOP_EVENT.is_set():
+
+            logging.exception(
+                "yt-dlp stdout reader failed "
+                "for producer #%d.",
+                producer_number,
+            )
+
+            state.set_reader_error(
+                str(exc)
+            )
+
+
+# ============================================================
+# Start producer
+# ============================================================
+
+def start_producer(
+    producer_number: int,
+):
+
     command = build_ytdlp_command()
 
     logging.info(
@@ -345,29 +728,18 @@ def start_producer(producer_number: int):
         producer_number,
     )
 
-    logging.info(
-        "yt-dlp format: %s",
-        FORMAT_ID,
-    )
-
     process = subprocess.Popen(
+
         command,
 
-        # stdout = MPEG-TS media.
-        stdout=subprocess.PIPE,
-
-        # stderr = diagnostics.
-        stderr=subprocess.PIPE,
-
-        # Don't add unnecessary buffering on the Python side.
-        bufsize=0,
-
-        # Keep stdin detached; yt-dlp should never ask us
-        # interactive questions.
         stdin=subprocess.DEVNULL,
 
-        # On Windows this ensures the subprocess tree can
-        # be terminated using taskkill /T.
+        stdout=subprocess.PIPE,
+
+        stderr=subprocess.PIPE,
+
+        bufsize=0,
+
         creationflags=getattr(
             subprocess,
             "CREATE_NEW_PROCESS_GROUP",
@@ -376,60 +748,98 @@ def start_producer(producer_number: int):
     )
 
     logging.info(
-        "yt-dlp producer #%d started with PID %d.",
+        "yt-dlp producer #%d started "
+        "(PID %d).",
         producer_number,
         process.pid,
     )
 
-    stderr_thread = threading.Thread(
-        target=read_producer_stderr,
-        args=(
-            process,
-            producer_number,
-        ),
-        name=f"yt-dlp-stderr-{producer_number}",
-        daemon=True,
-    )
-
-    stderr_thread.start()
-
     return process
 
 
-# ------------------------------------------------------------
-# Persistent FFmpeg archive process
-# ------------------------------------------------------------
+# ============================================================
+# FFmpeg stderr reader
+# ============================================================
+
+def ffmpeg_stderr_reader(
+    process: subprocess.Popen,
+):
+
+    if process.stderr is None:
+        return
+
+
+    try:
+
+        for raw_line in iter(
+            process.stderr.readline,
+            b"",
+        ):
+
+            if not raw_line:
+                break
+
+
+            line = raw_line.decode(
+                "utf-8",
+                errors="replace",
+            ).rstrip()
+
+
+            if line:
+
+                logging.warning(
+                    "[FFmpeg] %s",
+                    line,
+                )
+
+
+    except Exception:
+
+        if not STOP_EVENT.is_set():
+
+            logging.exception(
+                "FFmpeg stderr reader failed."
+            )
+
+
+# ============================================================
+# FFmpeg command
+# ============================================================
 
 def build_ffmpeg_command():
-    """
-    FFmpeg reads the persistent TCP MPEG-TS stream supplied
-    by the Python relay.
 
-    FFmpeg itself is never restarted during normal operation.
-    """
-
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = shutil.which(
+        "ffmpeg"
+    )
 
     if ffmpeg is None:
+
         raise RuntimeError(
             "FFmpeg was not found in PATH."
         )
+
 
     output_template = str(
         ARCHIVE_DIR
         / "GreenDayTV_%Y-%m-%d_%H-%M-%S.mkv"
     )
 
+
     return [
+
         ffmpeg,
 
         "-hide_banner",
+
         "-loglevel",
         "warning",
 
         "-nostdin",
 
-        # Persistent local TCP input
+        # ----------------------------------------------------
+        # MPEG-TS over local TCP.
+        # ----------------------------------------------------
 
         "-f",
         "mpegts",
@@ -437,7 +847,9 @@ def build_ffmpeg_command():
         "-i",
         f"tcp://{RELAY_HOST}:{RELAY_PORT}",
 
-        # Stream selection
+        # ----------------------------------------------------
+        # Stream selection.
+        # ----------------------------------------------------
 
         "-map",
         "0:v:0",
@@ -445,7 +857,9 @@ def build_ffmpeg_command():
         "-map",
         "0:a:0",
 
-        # NO re-encoding. Stream is already encoded.
+        # ----------------------------------------------------
+        # Absolutely no re-encoding.
+        # ----------------------------------------------------
 
         "-c:v",
         "copy",
@@ -453,7 +867,9 @@ def build_ffmpeg_command():
         "-c:a",
         "copy",
 
-        # Segmenting
+        # ----------------------------------------------------
+        # Hourly segmentation.
+        # ----------------------------------------------------
 
         "-f",
         "segment",
@@ -474,54 +890,16 @@ def build_ffmpeg_command():
     ]
 
 
-# ------------------------------------------------------------
-# FFmpeg stderr reader
-# ------------------------------------------------------------
-
-def read_ffmpeg_stderr(
-    process: subprocess.Popen,
-):
-    """
-    Copy FFmpeg diagnostics into the archive log.
-    """
-
-    if process.stderr is None:
-        return
-
-    try:
-        for raw_line in iter(
-            process.stderr.readline,
-            b"",
-        ):
-            if not raw_line:
-                break
-
-            line = raw_line.decode(
-                "utf-8",
-                errors="replace",
-            ).rstrip()
-
-            if line:
-                logging.warning(
-                    "[FFmpeg] %s",
-                    line,
-                )
-
-    except Exception:
-        logging.exception(
-            "FFmpeg stderr reader failed."
-        )
-
-
-# ------------------------------------------------------------
-# Start persistent FFmpeg
-# ------------------------------------------------------------
+# ============================================================
+# Start FFmpeg
+# ============================================================
 
 def start_ffmpeg():
+
     command = build_ffmpeg_command()
 
     logging.info(
-        "Starting persistent FFmpeg archive process..."
+        "Starting persistent FFmpeg..."
     )
 
     logging.info(
@@ -531,19 +909,21 @@ def start_ffmpeg():
     )
 
     logging.info(
-        "FFmpeg segmentation: %d seconds",
+        "Segmentation: %d seconds",
         SEGMENT_SECONDS,
     )
 
     logging.info(
-        "FFmpeg video: stream copy",
+        "Video: stream copy",
     )
 
     logging.info(
-        "FFmpeg audio: stream copy",
+        "Audio: stream copy",
     )
 
+
     process = subprocess.Popen(
+
         command,
 
         stdin=subprocess.DEVNULL,
@@ -555,277 +935,41 @@ def start_ffmpeg():
         bufsize=0,
     )
 
-    stderr_thread = threading.Thread(
-        target=read_ffmpeg_stderr,
-        args=(process,),
-        name="ffmpeg-stderr",
-        daemon=True,
-    )
 
-    stderr_thread.start()
+    threading.Thread(
+
+        target=ffmpeg_stderr_reader,
+
+        args=(process,),
+
+        name="ffmpeg-stderr",
+
+        daemon=True,
+
+    ).start()
+
 
     logging.info(
-        "Persistent FFmpeg started with PID %d.",
+        "Persistent FFmpeg started "
+        "(PID %d).",
         process.pid,
     )
+
 
     return process
 
 
-# ------------------------------------------------------------
-# Producer -> relay copy
-# ------------------------------------------------------------
-
-def relay_producer_output(
-    producer: subprocess.Popen,
-    client_socket: socket.socket,
-    producer_number: int,
-):
-    """
-    Copy MPEG-TS bytes from yt-dlp's stdout to the persistent
-    FFmpeg TCP connection.
-
-    Returns:
-        ("eof", last_data_time)
-        ("error", last_data_time)
-    """
-
-    if producer.stdout is None:
-        return "error", time.monotonic()
-
-    last_data_time = time.monotonic()
-
-    try:
-        while not STOP_REQUESTED:
-
-            data = producer.stdout.read(
-                RELAY_CHUNK_SIZE
-            )
-
-            if not data:
-                logging.warning(
-                    "yt-dlp producer #%d reached EOF.",
-                    producer_number,
-                )
-
-                return "eof", last_data_time
-
-            # Send the media to the persistent FFmpeg process.
-            client_socket.sendall(data)
-
-            last_data_time = time.monotonic()
-
-    except (BrokenPipeError, ConnectionResetError):
-        logging.error(
-            "FFmpeg TCP connection was lost."
-        )
-
-        return "error", last_data_time
-
-    except OSError as exc:
-        logging.error(
-            "Relay socket error: %s",
-            exc,
-        )
-
-        return "error", last_data_time
-
-    except Exception:
-        logging.exception(
-            "Unexpected relay failure."
-        )
-
-        return "error", last_data_time
-
-
-# ------------------------------------------------------------
-# Producer supervisor
-# ------------------------------------------------------------
-
-def supervise_producer(
-    client_socket: socket.socket,
-):
-    """
-    Keep yt-dlp alive and periodically replace its YouTube
-    HLS session.
-
-    The FFmpeg TCP connection remains open throughout.
-    """
-
-    producer_number = 0
-
-    while not STOP_REQUESTED:
-
-        producer_number += 1
-
-        producer = start_producer(
-            producer_number
-        )
-
-        producer_start_time = time.monotonic()
-
-        last_data_time = producer_start_time
-
-        logging.info(
-            "Producer #%d active.",
-            producer_number,
-        )
-
-        while not STOP_REQUESTED:
-
-            # Proactive refresh
-            producer_age = (
-                time.monotonic()
-                - producer_start_time
-            )
-
-            if producer_age >= PRODUCER_REFRESH_SECONDS:
-
-                logging.info(
-                    "Producer #%d has been running for "
-                    "%.1f hours; proactively refreshing "
-                    "the YouTube HLS session.",
-                    producer_number,
-                    producer_age / 3600,
-                )
-
-                terminate_process_tree(
-                    producer
-                )
-
-                break
-
-            # Read a chunk of media. This call is blocking while the producer is functioning normally.
-            if producer.stdout is None:
-                break
-
-            data = producer.stdout.read(
-                RELAY_CHUNK_SIZE
-            )
-
-            if data:
-
-                try:
-                    client_socket.sendall(data)
-
-                except (
-                    BrokenPipeError,
-                    ConnectionResetError,
-                    OSError,
-                ) as exc:
-
-                    logging.error(
-                        "FFmpeg relay connection lost: %s",
-                        exc,
-                    )
-
-                    terminate_process_tree(
-                        producer
-                    )
-
-                    return False
-
-                last_data_time = time.monotonic()
-
-                continue
-
-            # EOF from yt-dlp
-            return_code = producer.poll()
-
-            if return_code is not None:
-
-                logging.warning(
-                    "yt-dlp producer #%d exited with "
-                    "return code %s.",
-                    producer_number,
-                    return_code,
-                )
-
-                break
-
-            # No data but process still running.  This can indicate a hung FFmpeg HLS downloader.
-            idle_time = (
-                time.monotonic()
-                - last_data_time
-            )
-
-            if idle_time >= PRODUCER_STALL_SECONDS:
-
-                logging.warning(
-                    "yt-dlp producer #%d has produced "
-                    "no media data for %.1f seconds.",
-                    producer_number,
-                    idle_time,
-                )
-
-                logging.warning(
-                    "Assuming the YouTube HLS downloader "
-                    "is stalled; restarting it."
-                )
-
-                terminate_process_tree(
-                    producer
-                )
-
-                break
-
-            time.sleep(0.1)
-
-        # Clean up producer
-        if producer.poll() is None:
-            terminate_process_tree(
-                producer
-            )
-
-        try:
-            producer.wait(
-                timeout=10
-            )
-        except subprocess.TimeoutExpired:
-            logging.error(
-                "yt-dlp did not terminate after taskkill."
-            )
-
-        if STOP_REQUESTED:
-            break
-
-        logging.info(
-            "Starting replacement yt-dlp producer "
-            "in %d second...",
-            PRODUCER_RESTART_DELAY_SECONDS,
-        )
-
-        for _ in range(
-            PRODUCER_RESTART_DELAY_SECONDS
-        ):
-
-            if STOP_REQUESTED:
-                break
-
-            time.sleep(1)
-
-    return True
-
-
-# ------------------------------------------------------------
+# ============================================================
 # Relay server
-# ------------------------------------------------------------
+# ============================================================
 
 def create_relay_server():
-    """
-    Create a persistent local TCP endpoint.
-
-    FFmpeg connects once and stays connected.
-
-    The producer can then be replaced underneath it.
-    """
 
     server = socket.socket(
         socket.AF_INET,
         socket.SOCK_STREAM,
     )
 
-    # Allow immediate reuse if the program is restarted.
     server.setsockopt(
         socket.SOL_SOCKET,
         socket.SO_REUSEADDR,
@@ -842,7 +986,8 @@ def create_relay_server():
     server.listen(1)
 
     logging.info(
-        "Relay listening on tcp://%s:%d",
+        "Relay listening on "
+        "tcp://%s:%d",
         RELAY_HOST,
         RELAY_PORT,
     )
@@ -850,135 +995,40 @@ def create_relay_server():
     return server
 
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+# ============================================================
+# Accept FFmpeg
+# ============================================================
 
-def main():
-    global STOP_REQUESTED
+def accept_ffmpeg(
+    relay_server: socket.socket,
+):
 
-    ARCHIVE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    relay_server.settimeout(
+        FFMPEG_CONNECT_TIMEOUT_SECONDS
     )
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(message)s"
-        ),
-        handlers=[
-            logging.StreamHandler(),
-
-            logging.FileHandler(
-                ARCHIVE_DIR / "archive.log",
-                encoding="utf-8",
-            ),
-        ],
-    )
-
-    signal.signal(
-        signal.SIGINT,
-        request_stop,
-    )
-
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(
-            signal.SIGTERM,
-            request_stop,
-        )
-
-    check_dependencies()
-
-    logging.info(
-        "=============================================="
-    )
-
-    logging.info(
-        "Green Day TV 24/7 archiver"
-    )
-
-    logging.info(
-        "=============================================="
-    )
-
-    logging.info(
-        "Archive directory: %s",
-        ARCHIVE_DIR,
-    )
-
-    logging.info(
-        "YouTube stream: %s",
-        STREAM_URL,
-    )
-
-    logging.info(
-        "YouTube format: %s",
-        FORMAT_ID,
-    )
-
-    logging.info(
-        "Format: 1920x1080 @ 30 FPS, H.264 + AAC"
-    )
-
-    logging.info(
-        "Segment duration: %d seconds",
-        SEGMENT_SECONDS,
-    )
-
-    logging.info(
-        "Video encoding: NONE"
-    )
-
-    logging.info(
-        "Audio encoding: NONE"
-    )
-
-    logging.info(
-        "Producer refresh: %.1f hours",
-        PRODUCER_REFRESH_SECONDS / 3600,
-    )
-
-    logging.info(
-        "Producer stall timeout: %.1f seconds",
-        PRODUCER_STALL_SECONDS,
-    )
-
-    logging.info("")
-
-
-    if not check_disk_space():
-        return
-
-    relay_server = create_relay_server()
-
-    ffmpeg_process = start_ffmpeg()
-    logging.info(
-        "Waiting for FFmpeg to connect to the relay..."
-    )
-
-    relay_server.settimeout(30)
 
     try:
-        client_socket, client_address = relay_server.accept()
-        
-    except socket.timeout:
-        logging.error(
-            "FFmpeg did not connect to the relay within 30 seconds."
+
+        client_socket, client_address = (
+            relay_server.accept()
         )
 
-        if ffmpeg_process.poll() is None:
-            ffmpeg_process.terminate()
+    except socket.timeout:
 
-        relay_server.close()
-
-        return
+        raise RuntimeError(
+            "FFmpeg did not connect to "
+            "the relay within "
+            f"{FFMPEG_CONNECT_TIMEOUT_SECONDS} "
+            "seconds."
+        )
 
     finally:
-        relay_server.settimeout(None)
-        
+
+        relay_server.settimeout(
+            None
+        )
+
 
     logging.info(
         "FFmpeg connected from %s:%s.",
@@ -986,9 +1036,14 @@ def main():
         client_address[1],
     )
 
-    # Larger socket buffers help absorb small network/restart
-    # interruptions without involving FFmpeg itself.
+
+    # --------------------------------------------------------
+    # Large TCP buffers are useful here, but the Python queue
+    # remains independently bounded.
+    # --------------------------------------------------------
+
     try:
+
         client_socket.setsockopt(
             socket.SOL_SOCKET,
             socket.SO_SNDBUF,
@@ -1002,77 +1057,996 @@ def main():
         )
 
     except OSError:
+
         pass
 
-    try:
 
-        supervise_producer(
-            client_socket
-        )
-
-    except Exception:
-        logging.exception(
-            "Producer supervisor failed."
-        )
-
-    logging.info(
-        "Closing relay connection..."
+    # IMPORTANT:
+    #
+    # sendall() gets a finite timeout.  This prevents a dead
+    # FFmpeg process from trapping the relay forever.
+    client_socket.settimeout(
+        RELAY_SEND_TIMEOUT_SECONDS
     )
 
-    try:
-        client_socket.shutdown(
-            socket.SHUT_RDWR
-        )
-    except OSError:
-        pass
 
-    try:
-        client_socket.close()
-    except OSError:
-        pass
+    return client_socket
 
-    try:
-        relay_server.close()
-    except OSError:
-        pass
 
-    # Give FFmpeg a short opportunity to finish the final
-    # partial segment after receiving EOF.
-    if ffmpeg_process.poll() is None:
+# ============================================================
+# Relay writer thread
+# ============================================================
 
-        logging.info(
-            "Stopping FFmpeg..."
-        )
+def relay_writer(
+    client_socket: socket.socket,
+    data_queue: queue.Queue,
+    relay_state: dict,
+):
+
+    while not STOP_EVENT.is_set():
 
         try:
-            ffmpeg_process.wait(
-                timeout=10
+
+            data = data_queue.get(
+                timeout=0.5
             )
 
-        except subprocess.TimeoutExpired:
+        except queue.Empty:
 
-            logging.warning(
-                "FFmpeg did not exit normally; terminating."
+            continue
+
+
+        try:
+
+            client_socket.sendall(
+                data
             )
 
-            ffmpeg_process.terminate()
+            with relay_state["lock"]:
+
+                relay_state[
+                    "last_successful_send"
+                ] = time.monotonic()
+
+
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            socket.timeout,
+            OSError,
+        ) as exc:
+
+            with relay_state["lock"]:
+
+                relay_state["error"] = (
+                    str(exc)
+                )
+
+                relay_state["failed"] = True
+
+
+            logging.error(
+                "FFmpeg relay connection lost: %s",
+                exc,
+            )
+
+            return
+
+
+# ============================================================
+# Producer supervisor
+# ============================================================
+
+def supervise_producer(
+    client_socket: socket.socket,
+    ffmpeg_process: subprocess.Popen,
+):
+
+    producer_number = 0
+
+    data_queue = queue.Queue(
+        maxsize=QUEUE_MAX_CHUNKS
+    )
+
+
+    relay_state = {
+
+        "lock": threading.Lock(),
+
+        "failed": False,
+
+        "error": None,
+
+        "last_successful_send": (
+            time.monotonic()
+        ),
+    }
+
+
+    relay_thread = threading.Thread(
+
+        target=relay_writer,
+
+        args=(
+            client_socket,
+            data_queue,
+            relay_state,
+        ),
+
+        name="relay-writer",
+
+        daemon=True,
+    )
+
+    relay_thread.start()
+
+
+    last_disk_check = time.monotonic()
+
+
+    while not STOP_EVENT.is_set():
+
+        producer_number += 1
+
+        producer = None
+        state = ProducerState()
+
+
+        try:
+
+            producer = start_producer(
+                producer_number
+            )
+
+
+            # ------------------------------------------------
+            # Producer stderr
+            # ------------------------------------------------
+
+            stderr_thread = threading.Thread(
+
+                target=producer_stderr_reader,
+
+                args=(
+                    producer,
+                    producer_number,
+                    state,
+                ),
+
+                name=(
+                    f"yt-dlp-stderr-{producer_number}"
+                ),
+
+                daemon=True,
+            )
+
+            stderr_thread.start()
+
+
+            # ------------------------------------------------
+            # Producer stdout
+            # ------------------------------------------------
+
+            stdout_thread = threading.Thread(
+
+                target=producer_stdout_reader,
+
+                args=(
+                    producer,
+                    data_queue,
+                    producer_number,
+                    state,
+                ),
+
+                name=(
+                    f"yt-dlp-stdout-{producer_number}"
+                ),
+
+                daemon=True,
+            )
+
+            stdout_thread.start()
+
+
+            logging.info(
+                "Producer #%d is active.",
+                producer_number,
+            )
+
+
+            restart_reason = None
+
+
+            # =================================================
+            # Producer supervision loop
+            # =================================================
+
+            while not STOP_EVENT.is_set():
+
+                now = time.monotonic()
+
+
+                # ------------------------------------------------
+                # Is FFmpeg itself dead?
+                # ------------------------------------------------
+
+                ffmpeg_return_code = (
+                    ffmpeg_process.poll()
+                )
+
+                if (
+                    ffmpeg_return_code is not None
+                ):
+
+                    restart_reason = (
+                        "FFmpeg exited "
+                        f"({ffmpeg_return_code})"
+                    )
+
+                    logging.error(
+                        "FFmpeg exited with "
+                        "return code %s.",
+                        ffmpeg_return_code,
+                    )
+
+                    break
+
+
+                # ------------------------------------------------
+                # Did the relay fail?
+                # ------------------------------------------------
+
+                with relay_state["lock"]:
+
+                    relay_failed = (
+                        relay_state["failed"]
+                    )
+
+                    relay_error = (
+                        relay_state["error"]
+                    )
+
+
+                if relay_failed:
+
+                    restart_reason = (
+                        "FFmpeg relay failed"
+                    )
+
+                    if relay_error:
+
+                        logging.error(
+                            "Relay failure: %s",
+                            relay_error,
+                        )
+
+                    break
+
+
+                # ------------------------------------------------
+                # Disk-space watchdog.
+                # ------------------------------------------------
+
+                if (
+                    now - last_disk_check
+                    >= DISK_CHECK_INTERVAL_SECONDS
+                ):
+
+                    last_disk_check = now
+
+                    if not check_disk_space():
+
+                        STOP_EVENT.set()
+
+                        restart_reason = (
+                            "insufficient disk space"
+                        )
+
+                        break
+
+
+                snapshot = state.snapshot()
+
+
+                # ------------------------------------------------
+                # Repeated 401 / 403.
+                #
+                # THIS is what fixes the failure shown in
+                # your log.
+                # ------------------------------------------------
+
+                if snapshot["fatal_reason"]:
+
+                    restart_reason = (
+                        snapshot["fatal_reason"]
+                    )
+
+                    logging.error(
+                        "Producer #%d is unhealthy: %s",
+                        producer_number,
+                        restart_reason,
+                    )
+
+                    break
+
+
+                # ------------------------------------------------
+                # Producer process exited.
+                # ------------------------------------------------
+
+                return_code = producer.poll()
+
+                if return_code is not None:
+
+                    restart_reason = (
+                        "process exited "
+                        f"({return_code})"
+                    )
+
+                    logging.warning(
+                        "yt-dlp producer #%d "
+                        "exited with return code %s.",
+                        producer_number,
+                        return_code,
+                    )
+
+                    break
+
+
+                # ------------------------------------------------
+                # EOF.
+                # ------------------------------------------------
+
+                if snapshot["eof"]:
+
+                    restart_reason = (
+                        "stdout EOF"
+                    )
+
+                    break
+
+
+                # ------------------------------------------------
+                # Reader failure.
+                # ------------------------------------------------
+
+                if snapshot["reader_error"]:
+
+                    restart_reason = (
+                        "stdout reader error"
+                    )
+
+                    logging.error(
+                        "Producer #%d stdout reader "
+                        "failed: %s",
+                        producer_number,
+                        snapshot[
+                            "reader_error_message"
+                        ],
+                    )
+
+                    break
+
+
+                # ------------------------------------------------
+                # Scheduled refresh.
+                # ------------------------------------------------
+
+                age = (
+                    now
+                    - snapshot["start_time"]
+                )
+
+
+                if (
+                    age
+                    >= PRODUCER_REFRESH_SECONDS
+                ):
+
+                    restart_reason = (
+                        "scheduled refresh"
+                    )
+
+                    logging.info(
+                        "Producer #%d reached "
+                        "%.2f hours; refreshing "
+                        "YouTube session.",
+                        producer_number,
+                        age / 3600,
+                    )
+
+                    break
+
+
+                # ------------------------------------------------
+                # Media watchdog.
+                # ------------------------------------------------
+
+                if snapshot["bytes_received"] == 0:
+
+                    startup_idle = (
+                        now
+                        - snapshot["start_time"]
+                    )
+
+
+                    if (
+                        startup_idle
+                        >= PRODUCER_STARTUP_TIMEOUT_SECONDS
+                    ):
+
+                        restart_reason = (
+                            "producer never produced "
+                            "media"
+                        )
+
+                        logging.error(
+                            "Producer #%d produced no "
+                            "media for %.1f seconds.",
+                            producer_number,
+                            startup_idle,
+                        )
+
+                        break
+
+
+                else:
+
+                    media_idle = (
+                        now
+                        - snapshot[
+                            "last_data_time"
+                        ]
+                    )
+
+
+                    if (
+                        media_idle
+                        >= PRODUCER_STALL_SECONDS
+                    ):
+
+                        restart_reason = (
+                            "producer stalled"
+                        )
+
+                        logging.warning(
+                            "Producer #%d produced no "
+                            "media for %.1f seconds.",
+                            producer_number,
+                            media_idle,
+                        )
+
+                        break
+
+
+                time.sleep(0.25)
+
+
+            # =================================================
+            # Stop current producer
+            # =================================================
+
+            if (
+                producer is not None
+                and producer.poll() is None
+            ):
+
+                terminate_process_tree(
+                    producer,
+                    f"yt-dlp #{producer_number}",
+                )
+
+
+            # ------------------------------------------------
+            # Give the stdout reader a chance to finish.
+            #
+            # This is important: we do NOT start a new producer
+            # while the old producer might still be putting
+            # stale bytes into the shared queue.
+            # ------------------------------------------------
 
             try:
-                ffmpeg_process.wait(
+
+                stdout_thread.join(
+                    timeout=3
+                )
+
+            except Exception:
+
+                pass
+
+
+            try:
+
+                producer.wait(
                     timeout=5
                 )
+
             except subprocess.TimeoutExpired:
-                ffmpeg_process.kill()
+
+                logging.warning(
+                    "yt-dlp producer #%d did not "
+                    "exit normally.",
+                    producer_number,
+                )
+
+                terminate_process_tree(
+                    producer,
+                    f"yt-dlp #{producer_number}",
+                )
+
+
+            if STOP_EVENT.is_set():
+                break
+
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # We intentionally keep the same TCP connection to
+            # FFmpeg.  The queued old bytes remain ahead of the
+            # new producer's bytes, preserving ordering.
+            # ------------------------------------------------
+
+            if restart_reason:
+
+                logging.warning(
+                    "Replacing producer #%d: %s",
+                    producer_number,
+                    restart_reason,
+                )
+
+
+            # ------------------------------------------------
+            # Short restart delay.
+            # ------------------------------------------------
+
+            for _ in range(
+                PRODUCER_RESTART_DELAY_SECONDS * 4
+            ):
+
+                if STOP_EVENT.is_set():
+                    break
+
+                time.sleep(0.25)
+
+
+        except Exception:
+
+            logging.exception(
+                "Unhandled exception while "
+                "supervising producer #%d.",
+                producer_number,
+            )
+
+
+            if (
+                producer is not None
+                and producer.poll() is None
+            ):
+
+                terminate_process_tree(
+                    producer,
+                    f"yt-dlp #{producer_number}",
+                )
+
+
+            if STOP_EVENT.is_set():
+                break
+
+
+            # A supervisor exception must NOT kill the whole
+            # archiver. Treat it exactly like a failed producer.
+            time.sleep(
+                PRODUCER_RESTART_DELAY_SECONDS
+            )
+
+
+    return relay_state
+
+
+# ============================================================
+# One complete FFmpeg session
+# ============================================================
+
+def run_ffmpeg_session():
+
+    relay_server = None
+    client_socket = None
+    ffmpeg_process = None
+
+
+    try:
+
+        relay_server = create_relay_server()
+
+        ffmpeg_process = start_ffmpeg()
+
+
+        try:
+
+            client_socket = accept_ffmpeg(
+                relay_server
+            )
+
+        except Exception:
+
+            logging.exception(
+                "Could not establish the "
+                "FFmpeg relay."
+            )
+
+            return False
+
+
+        # We accept exactly one FFmpeg connection for this
+        # session. If FFmpeg later dies, the whole session is
+        # rebuilt.
+        try:
+
+            relay_server.close()
+
+        except OSError:
+
+            pass
+
+        relay_server = None
+
+
+        supervise_producer(
+            client_socket,
+            ffmpeg_process,
+        )
+
+
+        return STOP_EVENT.is_set()
+
+
+    except Exception:
+
+        logging.exception(
+            "FFmpeg session crashed."
+        )
+
+        return False
+
+
+    finally:
+
+        # ----------------------------------------------------
+        # Close producer -> FFmpeg TCP connection.
+        # ----------------------------------------------------
+
+        if client_socket is not None:
+
+            try:
+
+                client_socket.shutdown(
+                    socket.SHUT_RDWR
+                )
+
+            except OSError:
+
+                pass
+
+
+            try:
+
+                client_socket.close()
+
+            except OSError:
+
+                pass
+
+
+        # ----------------------------------------------------
+        # Stop FFmpeg.
+        # ----------------------------------------------------
+
+        if (
+            ffmpeg_process is not None
+            and ffmpeg_process.poll() is None
+        ):
+
+            if STOP_EVENT.is_set():
+
+                logging.info(
+                    "Waiting for FFmpeg to "
+                    "finish the current segment..."
+                )
+
+                try:
+
+                    ffmpeg_process.wait(
+                        timeout=10
+                    )
+
+                except subprocess.TimeoutExpired:
+
+                    logging.warning(
+                        "FFmpeg did not exit "
+                        "normally."
+                    )
+
+                    terminate_process_tree(
+                        ffmpeg_process,
+                        "FFmpeg",
+                    )
+
+            else:
+
+                # Unexpected session failure.
+                # Do not leave a dead/hung FFmpeg process behind.
+                terminate_process_tree(
+                    ffmpeg_process,
+                    "FFmpeg",
+                )
+
+
+        # ----------------------------------------------------
+        # Close relay server.
+        # ----------------------------------------------------
+
+        if relay_server is not None:
+
+            try:
+
+                relay_server.close()
+
+            except OSError:
+
+                pass
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+
+    ARCHIVE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
+    logging.basicConfig(
+
+        level=logging.INFO,
+
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(message)s"
+        ),
+
+        handlers=[
+
+            logging.StreamHandler(),
+
+            logging.FileHandler(
+                ARCHIVE_DIR / "archive.log",
+                encoding="utf-8",
+            ),
+        ],
+    )
+
+
+    # --------------------------------------------------------
+    # Signals
+    # --------------------------------------------------------
+
+    signal.signal(
+        signal.SIGINT,
+        request_stop,
+    )
+
+    if hasattr(signal, "SIGTERM"):
+
+        signal.signal(
+            signal.SIGTERM,
+            request_stop,
+        )
+
+
+    # --------------------------------------------------------
+    # Dependencies
+    # --------------------------------------------------------
+
+    check_dependencies()
+
+
+    # --------------------------------------------------------
+    # Startup information
+    # --------------------------------------------------------
 
     logging.info(
-        "FFmpeg final return code: %s",
-        ffmpeg_process.returncode,
+        "=============================================="
     )
+
+    logging.info(
+        "Green Day TV 24/7 Archiver"
+    )
+
+    logging.info(
+        "=============================================="
+    )
+
+    logging.info(
+        "Archive directory: %s",
+        ARCHIVE_DIR,
+    )
+
+    logging.info(
+        "Stream: %s",
+        STREAM_URL,
+    )
+
+    logging.info(
+        "Format: %s",
+        FORMAT_ID,
+    )
+
+    logging.info(
+        "Video: 1920x1080 @ 30 FPS, H.264",
+    )
+
+    logging.info(
+        "Audio: AAC",
+    )
+
+    logging.info(
+        "Segment duration: %d seconds",
+        SEGMENT_SECONDS,
+    )
+
+    logging.info(
+        "Video encoding: NONE",
+    )
+
+    logging.info(
+        "Audio encoding: NONE",
+    )
+
+    logging.info(
+        "Producer refresh: %.2f hours",
+        PRODUCER_REFRESH_SECONDS / 3600,
+    )
+
+    logging.info(
+        "Producer stall timeout: %.1f seconds",
+        PRODUCER_STALL_SECONDS,
+    )
+
+    logging.info(
+        "Producer startup timeout: %.1f seconds",
+        PRODUCER_STARTUP_TIMEOUT_SECONDS,
+    )
+
+    logging.info(
+        "HTTP 401/403 threshold: %d failures "
+        "within %.0f seconds",
+        HTTP_AUTH_FAILURE_THRESHOLD,
+        HTTP_AUTH_FAILURE_WINDOW_SECONDS,
+    )
+
+    logging.info(
+        "Relay queue: %.1f MiB",
+        QUEUE_MAX_BYTES / (1024 * 1024),
+    )
+
+    logging.info("")
+
+
+    # --------------------------------------------------------
+    # Initial disk check
+    # --------------------------------------------------------
+
+    if not check_disk_space():
+
+        return
+
+
+    # ========================================================
+    # Outer FFmpeg/session supervisor
+    #
+    # This loop is intentionally extremely important.
+    #
+    # The old script had one FFmpeg process for the lifetime
+    # of the program.  If that process died, the archive died.
+    #
+    # Here, FFmpeg itself is replaceable.
+    # ========================================================
+
+    backoff = (
+        SESSION_BACKOFF_INITIAL_SECONDS
+    )
+
+
+    while not STOP_EVENT.is_set():
+
+        logging.info(
+            "Starting archive session..."
+        )
+
+
+        try:
+
+            clean_shutdown = (
+                run_ffmpeg_session()
+            )
+
+
+            if STOP_EVENT.is_set():
+
+                break
+
+
+            if clean_shutdown:
+
+                break
+
+
+            logging.error(
+                "Archive session ended "
+                "unexpectedly."
+            )
+
+
+        except Exception:
+
+            logging.exception(
+                "Unexpected exception in "
+                "outer supervisor."
+            )
+
+
+        if STOP_EVENT.is_set():
+
+            break
+
+
+        logging.warning(
+            "Restarting archive session "
+            "in %.1f seconds.",
+            backoff,
+        )
+
+
+        deadline = (
+            time.monotonic()
+            + backoff
+        )
+
+
+        while (
+            time.monotonic() < deadline
+            and not STOP_EVENT.is_set()
+        ):
+
+            time.sleep(0.25)
+
+
+        backoff = min(
+            backoff * 2,
+            SESSION_BACKOFF_MAX_SECONDS,
+        )
+
+
+    # --------------------------------------------------------
+    # Final shutdown
+    # --------------------------------------------------------
 
     logging.info(
         "Archiver stopped."
     )
 
 
+# ============================================================
+# Entry point
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
