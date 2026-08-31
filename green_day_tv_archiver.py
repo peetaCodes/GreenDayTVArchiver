@@ -4,11 +4,15 @@ import logging
 import shutil
 import signal
 import subprocess
+import os
 import sys
+import re
 import threading
 import time
 from pathlib import Path
 
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 # ============================================================
 # Green Day TV 24/7 Archiver
@@ -37,36 +41,71 @@ from pathlib import Path
 # Configuration
 # ------------------------------------------------------------
 
+# Your local timezone. Needed to convert timestamps UTC.
+# Change this if necessary.
+# (Obviously) this will never be saved anywhere.
+LOCAL_TIMEZONE = ZoneInfo("Europe/Rome")
+
 STREAM_URL = (
-    "https://www.youtube.com/watch?v=Xu90G4oFq2o"
+    "https://www.youtube.com/watch?v=Xu90G4oFq2o" # GDTV
 )
 
+# Where to store the archived footage files. Change this is you want.
+# I STRONGLY suggest using an external drive to not fill up/slow down your main drive.
 ARCHIVE_DIR = Path(
     r"D:\Pietro\Archives\GreenDayTV"
 )
 
+# Default length of one source file: 1 hour (60 seconds * 60 minutes).
+# I suggest keeping this under 3 hours, with 5 hours as a maximum.
+#  this is to avoid chances of corruption
+#  and preventing the program from slowing down
+#  due to trying to append to an enormous file.
+#
+# To change this to 2 hours, for example, use 2 * 60 * 60.
 SEGMENT_SECONDS = 60 * 60
 
+# Minimum amount of GB to always leave available on the archive destination's drive.
+# Note that this is constantly checked for by the program
+#  and it will stop archiving if this limit is reached.
 MIN_FREE_GB = 10
 
-RETRY_SECONDS = 18
+# Number of seconds to wait before re-connecting to YouTube after an HTTP error.
+# Please keep this higher than 5 (seconds) as otherwise it may result in too many requests
+#   if this happens, you ISP might slow you down.
+RETRY_SECONDS = 6.5
 
 # If yt-dlp produces no download progress for this long after
 # media has started, restart the complete recording session.
 #
-# HLS fragments here are ~5 seconds, so 30 seconds gives plenty
+# HLS fragments here are ~5 seconds, so 12 seconds gives plenty
 # of tolerance without allowing a dead session to sit forever.
-STALL_SECONDS = 30
+# Please do not set this any lower than 6.5
+STALL_SECONDS = 12
 
 # Maximum time allowed for yt-dlp to start producing media.
-STARTUP_TIMEOUT_SECONDS = 90
+STARTUP_TIMEOUT_SECONDS = 25
+
+# Global FFmpeg executable
+FFMPEG = shutil.which("ffmpeg")
 
 
 # ------------------------------------------------------------
-# Global shutdown flag
+# Global shutdown/recodring flags
 # ------------------------------------------------------------
 
 STOP_REQUESTED = False
+RECORDING_ACTIVE = False
+
+# Shell util to run commands
+def run(command: list[str]):
+    return subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
 
 
 # ------------------------------------------------------------
@@ -242,10 +281,119 @@ def read_ffmpeg_stderr(process):
 # Run one complete recording session
 # ------------------------------------------------------------
 
-def run_recording():
-    ffmpeg = shutil.which("ffmpeg")
+def finalise_segment(path: Path, ffmpeg):
+    match = re.match(
+        r"^GreenDayTV_(\d{4}-\d{2}-\d{2})_"
+        r"(\d{2}-\d{2}-\d{2})\.local\.mkv$",
+        path.name,
+    )
 
-    if ffmpeg is None:
+    if match is None:
+        return
+
+    date_part, time_part = match.groups()
+
+    local_start = datetime.strptime(
+        f"{date_part} {time_part}",
+        "%Y-%m-%d %H-%M-%S",
+    ).replace(
+        tzinfo=LOCAL_TIMEZONE
+    )
+
+    utc_start = local_start.astimezone(
+        timezone.utc
+    )
+
+    utc_timestamp = utc_start.strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    output = path.with_name(
+        f"GreenDayTV_{utc_start:%Y-%m-%d}_"
+        f"{utc_start:%H-%M-%S}.mkv"
+    )
+
+    temporary_output = path.with_name(
+        f".{output.name}.tmp.mkv"
+    )
+
+    result = run([
+        ffmpeg,
+        "-y",
+        "-i", str(path),
+        "-map", "0",
+        "-c", "copy",
+        "-metadata",
+        f"comment={utc_timestamp}",
+        "-metadata",
+        f"creation_time={utc_timestamp}",
+        str(temporary_output),
+    ])
+
+    if result.returncode != 0:
+        logging.error(
+            "Failed to finalise segment %s:\n%s",
+            path,
+            result.stderr,
+        )
+
+        temporary_output.unlink(
+            missing_ok=True
+        )
+
+        return
+
+    path.unlink()
+
+    temporary_output.replace(
+        output
+    )
+    
+    
+def segment_finaliser_loop():
+    global RECORDING_ACTIVE, FFMPEG
+
+    while not STOP_REQUESTED:
+        try:
+            paths = sorted(
+                ARCHIVE_DIR.glob(
+                    "GreenDayTV_*.local.mkv"
+                )
+            )
+
+            if RECORDING_ACTIVE and paths:
+                paths = paths[:-1]
+
+            for path in paths:
+                finalise_segment(
+                    path,
+                    FFMPEG,
+                )
+
+        except Exception:
+            if not STOP_REQUESTED:
+                logging.exception(
+                    "Segment finalizer failed."
+                )
+
+        time.sleep(1)
+        
+
+def wait_until_stable(path: Path):
+    try:
+        size1 = path.stat().st_size
+        time.sleep(0.5)
+        size2 = path.stat().st_size
+    except FileNotFoundError:
+        return False
+
+    return size1 == size2
+        
+
+def run_recording():
+    global RECORDING_ACTIVE
+    
+    if FFMPEG is None:
         raise RuntimeError(
             "FFmpeg was not found in PATH."
         )
@@ -293,11 +441,11 @@ def run_recording():
 
     output_template = str(
         ARCHIVE_DIR
-        / "GreenDayTV_%Y-%m-%d_%H-%M-%S.mkv"
+        / "GreenDayTV_%Y-%m-%d_%H-%M-%S.local.mkv"
     )
 
     ffmpeg_command = [
-        ffmpeg,
+        FFMPEG,
 
         "-hide_banner",
         "-loglevel",
@@ -376,6 +524,8 @@ def run_recording():
             stderr=subprocess.PIPE,
             bufsize=0,
         )
+        
+        RECORDING_ACTIVE = True
 
         # The parent no longer needs this handle.
         ytdlp_process.stdout.close()
@@ -545,6 +695,8 @@ def run_recording():
                     ffmpeg_process,
                     "FFmpeg",
                 )
+                
+        RECORDING_ACTIVE = False
 
         # ----------------------------------------------------
         # Allow stderr readers to finish.
@@ -688,6 +840,16 @@ def main():
     )
 
     logging.info("")
+    
+    
+    
+    finaliser_thread = threading.Thread(
+        target=segment_finaliser_loop,
+        daemon=True,
+        name="segment-finaliser",
+    )
+
+    finaliser_thread.start()
 
     # --------------------------------------------------------
     # Continuous recording loop.
