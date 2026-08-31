@@ -1125,7 +1125,7 @@ def process_day(day, segments: list[dict]):
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    today = datetime.now().replace(tzinfo=timezone.utc).date() # Convert today to UTC: every time(-zone)-related operation should always use UTC.
+    today = datetime.now(timezone.utc).date() # Convert today to UTC: every time(-zone)-related operation should always use UTC.
     source_segments = get_source_segments()
     days = build_day_segments(source_segments)
 
