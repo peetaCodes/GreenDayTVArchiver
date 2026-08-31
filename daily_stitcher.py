@@ -1,8 +1,10 @@
 import json
 import re
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from zoneinfo import ZoneInfo
 
 
 # ============================================================
@@ -16,6 +18,7 @@ from pathlib import Path
 # source footage needs to be trimmed.
 # ============================================================
 
+# The path containing the archived MKV files. Change this if necessary
 ARCHIVE_DIR = Path(r"D:\Pietro\Archives\GreenDayTV")
 OUTPUT_DIR = ARCHIVE_DIR / "Daily"
 
@@ -23,13 +26,19 @@ FFMPEG = "ffmpeg"
 FFPROBE = "ffprobe"
 MKVMERGE = "mkvmerge"
 
-SEGMENT_RE = re.compile(
-    r"^GreenDayTV_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})\.mkv$"
-)
+# Duration in seconds of every notice/warning inserted into the final stitched video.
+NOTICE_DURATION = 1.35
 
-NOTICE_DURATION = 1.3
+# Significant gap threshold (ins seconds)
+# If the script detects a gap between the archived footage
+# equal or longer than this value, it will insert a notice.
 SIGNIFICANT_GAP = 8
 
+# This is deprecated and here only for backwards compatibility.
+# The script now calculates the timestamp using and embedded comment in the file.
+# For now it's still compatible with older versions of the archiver, producing files without the comment.
+# I'll remove this in a further version.
+SEGMENT_RE = re.compile( r"^GreenDayTV_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})\.mkv$" )
 
 def sanitise_windows_path(path: Path):
     return path.as_posix().replace(":", r"\:")
@@ -218,6 +227,7 @@ def probe_media_info(path: Path):
         ),
     }
 
+
 def probe_audio_sample_rate(path: Path):
     result = run([
         FFPROBE,
@@ -234,9 +244,21 @@ def probe_audio_sample_rate(path: Path):
         raise RuntimeError(f"Could not determine audio sample rate of {path}")
 
     return int(value)
-
+    
 
 def parse_filename(path: Path):
+    """
+    Legacy filename parser.
+    
+    This is DEPRECATED and here only for backwards compatibility.
+    The script now calculates the timestamp using and embedded comment in the file.
+    For now it's still compatible with older versions of the archiver, producing files without the comment.
+    I'll remove this in a further version.
+
+    Returns a NAIVE datetime because the timezone of old files
+    is not known here. The caller is responsible for assigning
+    the user-selected legacy timezone and converting it to UTC.
+    """
     match = SEGMENT_RE.match(path.name)
 
     if not match:
@@ -250,23 +272,96 @@ def parse_filename(path: Path):
     )
 
 
+def probe_embedded_timestamp(path: Path):
+    result = run([
+        FFPROBE,
+        "-v", "error",
+        "-show_entries", "format_tags=comment",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ])
+
+    value = result.stdout.strip()
+
+    if not value:
+        return None
+
+    try:
+        timestamp = datetime.strptime(
+            value,
+            "%Y-%m-%dT%H:%M:%SZ",
+        )
+
+        return timestamp.replace(
+            tzinfo=timezone.utc
+        )
+
+    except ValueError:
+        raise RuntimeError(
+            f"Invalid embedded timestamp in {path}: {value!r}"
+        )
+
+
 def get_source_segments():
     segments = []
+    legacy_timezone = None
 
     for path in ARCHIVE_DIR.glob("GreenDayTV_*.mkv"):
-        start = parse_filename(path)
-
-        if start is None:
+        if path.name.endswith(".local.mkv"):
             continue
-
+            
         try:
+            start = probe_embedded_timestamp(path)
             duration = probe_duration(path)
             media = probe_media_info(path)
-        except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            
+            # Backwards compatibility:
+            # fall back to the old filename timestamp if the
+            # embedded comment is missing or invalid.
+            if start is None:
+                print(
+                    f"[WARNING] No embedded timestamp comment found in "
+                    f"{path}. Using legacy filename parsing logic."
+                )
+
+                if legacy_timezone is None:
+                    while True:
+                        timezone_name = input(
+                            "Enter the IANA timezone used by these legacy "
+                            "files (for example 'America/Los_Angeles', 'Europe/London'...): "
+                        ).strip()
+
+                        try:
+                            legacy_timezone = ZoneInfo(timezone_name)
+                            break
+                        except Exception:
+                            print(
+                                f"[ERROR] Invalid timezone: {timezone_name!r}. "
+                                "Please enter a valid IANA timezone."
+                            )
+
+                start = parse_filename(path)
+
+                if start is None:
+                    continue
+
+                start = start.replace(
+                    tzinfo=legacy_timezone
+                ).astimezone(timezone.utc)
+                
+                
+
+        except (
+            RuntimeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
             print(f"Skipping {path}: {exc}")
             continue
 
-        end = start + timedelta(seconds=duration)
+        end = start + timedelta(
+            seconds=duration
+        )
 
         segments.append({
             "path": path,
@@ -279,7 +374,10 @@ def get_source_segments():
         })
 
     segments.sort(
-        key=lambda s: (s["source_start"], s["path"].name)
+        key=lambda s: (
+            s["source_start"],
+            s["path"].name,
+        )
     )
 
     return segments
@@ -296,6 +394,7 @@ def split_by_day(segment: dict):
         midnight = datetime.combine(
             current.date() + timedelta(days=1),
             datetime.min.time(),
+            tzinfo=timezone.utc,
         )
 
         parts.append({
@@ -322,7 +421,6 @@ def split_by_day(segment: dict):
         })
 
     return parts
-
 
 def build_day_segments(source_segments: list[dict]):
     days = {}
@@ -885,7 +983,9 @@ def process_day(day, segments: list[dict]):
     day_start = datetime.combine(
         day,
         datetime.min.time(),
+        tzinfo=timezone.utc,
     )
+
     day_end = day_start + timedelta(days=1)
 
     if not segments:
