@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from collections import deque
 import logging
 import os
 import re
@@ -12,36 +13,40 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from rotating_file_handler import (
+    FileLogFilter,
+    GZipRotatingFileHandler,
+)
+
 
 # ============================================================
 # Green Day TV - Robust 24/7 Stream Archiver
 #
-# yt-dlp downloads the live HLS stream to stdout.
-# FFmpeg reads that stream and creates hourly MKV segments.
+# yt-dlp downloads the YouTube HLS stream through FFmpeg and
+# writes MPEG-TS to stdout.
 #
-# The source YouTube format is NOT hard-coded to a numeric ID.
-# Instead, yt-dlp dynamically selects:
+# Python places that data into a bounded RAM buffer.
+# A second FFmpeg process reads the buffer and creates hourly
+# MKV files.
 #
-#   best 1080p-or-lower H.264 video + best audio
+# IMPORTANT:
+#   archive FFmpeg uses wall-clock segmentation rather than
+#   relying on the unstable timestamps coming from the HLS
+#   stream. This prevents timestamp discontinuities from
+#   generating hundreds of tiny files.
 #
-# This avoids failures when YouTube changes the available format
-# IDs (e.g. format 96 disappearing and format 270 being used).
-#
-# No source footage is re-encoded.
-#
-# Each active segment is first written as:
+# Completed .local.mkv files are finalized in the background:
 #
 #   GreenDayTV_YYYY-MM-DD_HH-MM-SS.local.mkv
-#
-# A background finalizer remuxes completed segments to:
-#
+#                         ↓
 #   GreenDayTV_YYYY-MM-DD_HH-MM-SS.mkv
 #
-# where the filename timestamp is converted from Europe/Rome
-# local time to UTC.
+# The timestamp is converted from Europe/Rome to UTC.
 #
-# A Windows named mutex prevents multiple copies of this script
-# from running simultaneously.
+# No audio or video is re-encoded.
+#
+# A Windows named mutex prevents multiple copies using this
+# script from running simultaneously.
 # ============================================================
 
 
@@ -49,77 +54,103 @@ from zoneinfo import ZoneInfo
 # Configuration
 # ============================================================
 
-# Your local timezone in IANA format (needed to convert timestamps to UTC).
-# IANA format: 'Continent/City', in english, spaces replaced with "_".
-# Examples: 'America/Washington_DC', 'Europe/Prague', 'Asia/Tokyo'.
-# NOTE: Only capitals and/or cities bounded with a timestamp will work.
-# Bad Examples: 'America/Berkley' (Use 'America/Los_Angeles'), 'Europe/Petersborough' (Use 'Europe/London').
-LOCAL_TIMEZONE = ZoneInfo("America/Los_Angeles")
+LOCAL_TIMEZONE = ZoneInfo("Europe/Rome")
 
-STREAM_URL = "https://www.youtube.com/watch?v=Xu90G4oFq2o"
+STREAM_URL = (
+    "https://www.youtube.com/watch?v=Xu90G4oFq2o"
+)
 
-# Where to store the segment files. Change this is necessary.
-# I STRONGLY suggest using en external drive to avoid filling up and/or slowing down your hard drive.
-# I suggest having at least 100GBs of free space, though the program should never actually use more than ~70GBs.
-ARCHIVE_DIR = Path(r"D:\Archives\GreenDayTV")
+ARCHIVE_DIR = Path(
+    r"D:\Pietro\Archives\GreenDayTV"
+)
 
-# Length of a single MKV segment file, in seconds.
-# Default: 1 hour (60 minutes * 60 seconds)
 SEGMENT_SECONDS = 60 * 60
 
-# Absolute minium amount of space to always leave free on the target drive.
-# WARNING: the script will STOP if the free space ever reaches this value.
 MIN_FREE_GB = 10
 
-# Number of seconds to wait after an HTTP error occurs before retrying.
 RETRY_SECONDS = 7
 
-# If no media data is observed shortly after startup, restart.
-STARTUP_TIMEOUT_SECONDS = 20
 
-# If the media stream stops producing data for this long,
-# consider the recording stalled.
-STALL_SECONDS = 12
-
-# yt-dlp retry settings.
-YTDLP_RETRIES = 2
-YTDLP_FRAGMENT_RETRIES = 2
-
-# TCP relay is not used here; yt-dlp stdout is piped directly
-# into FFmpeg.
+# ------------------------------------------------------------
+# YouTube format selection
+# ------------------------------------------------------------
 #
-# Chunk size used by the stdout reader.
-PIPE_READ_SIZE = 256 * 1024
-
-# Finalizer behavior.
-FINALIZER_INTERVAL = 2.0
-FINALIZER_STABLE_DELAY = 1.0
-
-# Temporary output created during finalization.
-FINALIZE_TEMP_SUFFIX = ".finalizing.mkv"
-
-# Dynamic yt-dlp selector.
+# Keep the known-good video+audio selection.
 #
-# Prefer:
-#   - video-only
-#   - H.264 / AVC
-#   - maximum resolution up to 1080p
-#   - best audio
+# Do NOT change this to a combined-only selector:
+# your current stream demonstrates that YouTube currently
+# provides 270 + 234 successfully.
 #
-# If that combination is unavailable, fall back to the best
-# combined format up to 1080p.
 FORMAT_SELECTOR = (
     "bestvideo[height<=1080][vcodec^=avc1]+bestaudio"
     "/best[height<=1080]"
 )
 
 
+# ------------------------------------------------------------
+# yt-dlp / HLS resilience
+# ------------------------------------------------------------
+
+YTDLP_RETRIES = 3
+YTDLP_FRAGMENT_RETRIES = 3
+
+# Startup can legitimately take well over one minute because
+# yt-dlp has to perform extraction and initialize both HLS
+# inputs before useful stdout appears.
+STARTUP_TIMEOUT_SECONDS = 180
+
+# Once media has actually started, a complete 60-second absence
+# of new bytes is considered a dead source.
+SOURCE_STALL_SECONDS = 60
+
+
+# ------------------------------------------------------------
+# RAM media buffer
+# ------------------------------------------------------------
+
+BUFFER_MAX_BYTES = 256 * 1024 * 1024
+
+BUFFER_CHUNK_SIZE = 256 * 1024
+
+BUFFER_LOG_INTERVAL_SECONDS = 30
+
+
+# ------------------------------------------------------------
+# Finalizer
+# ------------------------------------------------------------
+
+FINALIZE_MIN_AGE_SECONDS = 15 * 60
+
+FINALIZER_SCAN_INTERVAL = 30.0
+
+FINALIZER_STABLE_DELAY = 1.0
+
+FINALIZE_TEMP_SUFFIX = ".finalizing.mkv"
+
+
+# ------------------------------------------------------------
+# Files produced by the recorder
+# ------------------------------------------------------------
+
+FINALIZER_RE = re.compile(
+    r"^GreenDayTV_\d{4}-\d{2}-\d{2}_"
+    r"\d{2}-\d{2}-\d{2}\.local\.mkv$"
+)
+
+
 # ============================================================
-# Paths / executables
+# Executables
 # ============================================================
 
-YTDLP = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
-FFMPEG = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+YTDLP = (
+    shutil.which("yt-dlp")
+    or shutil.which("yt-dlp.exe")
+)
+
+FFMPEG = (
+    shutil.which("ffmpeg")
+    or shutil.which("ffmpeg.exe")
+)
 
 
 # ============================================================
@@ -128,85 +159,204 @@ FFMPEG = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
 
 LOG_FILE = ARCHIVE_DIR / "archiver.log"
 
+LOG_MAX_BYTES = 50 * 1024 * 1024
+LOG_TOTAL_MAX_BYTES = 0
+LOG_GZIP_LEVEL = 7
+
 
 def configure_logging() -> logging.Logger:
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(
+        "green_day_tv_archiver"
+    )
 
-    logger = logging.getLogger("GreenDayTV")
     logger.setLevel(logging.INFO)
 
-    if logger.handlers:
-        return logger
+    logger.propagate = False
+
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
 
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(message)s"
     )
 
-    file_handler = logging.FileHandler(
+    file_handler = GZipRotatingFileHandler(
         LOG_FILE,
-        encoding="utf-8",
+        max_bytes=LOG_MAX_BYTES,
+        total_max_bytes=LOG_TOTAL_MAX_BYTES,
+        compresslevel=LOG_GZIP_LEVEL,
     )
+
     file_handler.setFormatter(formatter)
 
+    file_handler.addFilter(
+        FileLogFilter()
+    )
+
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+
+    console_handler.setFormatter(
+        formatter
+    )
 
     logger.addHandler(file_handler)
+
     logger.addHandler(console_handler)
 
     return logger
 
 
+# Ensure ARCHIVE_DIR exists before the logger tries to create
+# archiver.log there.
+ARCHIVE_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
 log = configure_logging()
 
 
 # ============================================================
-# Global state
+# Shutdown
 # ============================================================
 
 SHUTDOWN_EVENT = threading.Event()
 
-# Exactly one current FFmpeg-generated segment.
-#
-# This is the important replacement for the old:
-#
-#     paths = paths[:-1]
-#
-# approach.
-#
-# The finalizer never needs to guess which file is active.
+
+# ============================================================
+# Active recording segment
+# ============================================================
+
 ACTIVE_SEGMENT_LOCK = threading.Lock()
+
 ACTIVE_SEGMENT: Path | None = None
+
+
+def get_active_segment() -> Path | None:
+    with ACTIVE_SEGMENT_LOCK:
+        return ACTIVE_SEGMENT
+
+
+def set_active_segment(
+    path: Path | None,
+) -> None:
+
+    global ACTIVE_SEGMENT
+
+    with ACTIVE_SEGMENT_LOCK:
+        ACTIVE_SEGMENT = path
+
+
+# ============================================================
+# Runtime statistics
+# ============================================================
+
+MEDIA_STATS_LOCK = threading.Lock()
+
+SOURCE_BYTES_RECEIVED = 0
+
+ARCHIVE_BYTES_WRITTEN = 0
+
+LAST_SOURCE_DATA_TIME = 0.0
+
+MEDIA_SEEN = False
+
+
+def reset_media_stats() -> None:
+
+    global SOURCE_BYTES_RECEIVED
+    global ARCHIVE_BYTES_WRITTEN
+    global LAST_SOURCE_DATA_TIME
+    global MEDIA_SEEN
+
+    with MEDIA_STATS_LOCK:
+
+        SOURCE_BYTES_RECEIVED = 0
+
+        ARCHIVE_BYTES_WRITTEN = 0
+
+        LAST_SOURCE_DATA_TIME = (
+            time.monotonic()
+        )
+
+        MEDIA_SEEN = False
+
+
+def note_source_bytes(
+    count: int,
+) -> None:
+
+    global SOURCE_BYTES_RECEIVED
+    global LAST_SOURCE_DATA_TIME
+    global MEDIA_SEEN
+
+    with MEDIA_STATS_LOCK:
+
+        SOURCE_BYTES_RECEIVED += count
+
+        LAST_SOURCE_DATA_TIME = (
+            time.monotonic()
+        )
+
+        MEDIA_SEEN = True
+
+
+def note_archive_bytes(
+    count: int,
+) -> None:
+
+    global ARCHIVE_BYTES_WRITTEN
+
+    with MEDIA_STATS_LOCK:
+
+        ARCHIVE_BYTES_WRITTEN += count
+
+
+def get_media_stats():
+
+    with MEDIA_STATS_LOCK:
+
+        return (
+            SOURCE_BYTES_RECEIVED,
+            ARCHIVE_BYTES_WRITTEN,
+            LAST_SOURCE_DATA_TIME,
+            MEDIA_SEEN,
+        )
 
 
 # ============================================================
 # Windows single-instance mutex
 # ============================================================
 
-MUTEX_NAME = "Global\\GreenDayTV_Archiver_SingleInstance"
+MUTEX_NAME = (
+    r"Global\GreenDayTV_Archiver_SingleInstance"
+)
 
 
-def acquire_single_instance() -> ctypes.c_void_p | None:
-    """
-    Acquire a Windows named mutex.
-
-    If another copy of this program already owns the mutex,
-    return None.
-    """
+def acquire_single_instance():
 
     if os.name != "nt":
         return object()
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes.WinDLL(
+        "kernel32",
+        use_last_error=True,
+    )
 
     kernel32.CreateMutexW.argtypes = [
         ctypes.c_void_p,
         ctypes.c_bool,
         ctypes.c_wchar_p,
     ]
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
 
-    kernel32.GetLastError.restype = ctypes.c_ulong
+    kernel32.CreateMutexW.restype = (
+        ctypes.c_void_p
+    )
+
+    kernel32.GetLastError.restype = (
+        ctypes.c_ulong
+    )
 
     ERROR_ALREADY_EXISTS = 183
 
@@ -217,122 +367,364 @@ def acquire_single_instance() -> ctypes.c_void_p | None:
     )
 
     if not handle:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes.WinError(
+            ctypes.get_last_error()
+        )
 
-    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+    if (
+        kernel32.GetLastError()
+        == ERROR_ALREADY_EXISTS
+    ):
+
         kernel32.CloseHandle(handle)
+
         return None
 
     return handle
 
 
-def release_single_instance(handle) -> None:
-    if os.name != "nt" or handle is None:
+def release_single_instance(
+    handle,
+) -> None:
+
+    if (
+        os.name != "nt"
+        or handle is None
+    ):
         return
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_bool
+    kernel32 = ctypes.WinDLL(
+        "kernel32",
+        use_last_error=True,
+    )
+
+    kernel32.CloseHandle.argtypes = [
+        ctypes.c_void_p,
+    ]
+
+    kernel32.CloseHandle.restype = (
+        ctypes.c_bool
+    )
 
     kernel32.CloseHandle(handle)
 
 
 # ============================================================
-# Utility functions
+# Windows process priority
 # ============================================================
 
-def free_space_gb(path: Path) -> float:
-    usage = shutil.disk_usage(path)
-    return usage.free / (1024 ** 3)
+def get_process_creation_flags(
+    priority: str,
+) -> int:
+
+    if os.name != "nt":
+        return 0
+
+    create_group = getattr(
+        subprocess,
+        "CREATE_NEW_PROCESS_GROUP",
+        0,
+    )
+
+    above_normal = 0x00008000
+
+    below_normal = 0x00004000
+
+    if priority == "above":
+
+        return (
+            create_group
+            | above_normal
+        )
+
+    if priority == "below":
+
+        return (
+            create_group
+            | below_normal
+        )
+
+    return create_group
 
 
-def parse_local_timestamp(path: Path) -> datetime:
-    """
-    Parse:
-        GreenDayTV_YYYY-MM-DD_HH-MM-SS.local.mkv
+# ============================================================
+# Disk space
+# ============================================================
 
-    as Europe/Rome local time.
-    """
+def free_space_gb(
+    path: Path,
+) -> float:
+
+    return (
+        shutil.disk_usage(path).free
+        / (1024 ** 3)
+    )
+
+
+# ============================================================
+# Timestamp handling
+# ============================================================
+
+def parse_local_timestamp(
+    path: Path,
+) -> datetime:
 
     match = re.match(
-        r"^GreenDayTV_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})"
-        r"\.local\.mkv$",
+        r"^GreenDayTV_(\d{4}-\d{2}-\d{2})_"
+        r"(\d{2}-\d{2}-\d{2})\.local\.mkv$",
         path.name,
     )
 
     if not match:
-        raise ValueError(f"Invalid segment filename: {path.name}")
 
-    date_part = match.group(1)
-    time_part = match.group(2)
+        raise ValueError(
+            f"Invalid segment filename: "
+            f"{path.name}"
+        )
 
     naive = datetime.strptime(
-        f"{date_part} {time_part}",
+        (
+            f"{match.group(1)} "
+            f"{match.group(2)}"
+        ),
         "%Y-%m-%d %H-%M-%S",
     )
 
-    return naive.replace(tzinfo=LOCAL_TIMEZONE)
-
-
-def utc_output_path(local_path: Path) -> Path:
-    local_dt = parse_local_timestamp(local_path)
-
-    utc_dt = local_dt.astimezone(timezone.utc)
-
-    return ARCHIVE_DIR / (
-        f"GreenDayTV_{utc_dt:%Y-%m-%d_%H-%M-%S}.mkv"
+    return naive.replace(
+        tzinfo=LOCAL_TIMEZONE
     )
 
 
-def is_file_stable(path: Path, delay: float = FINALIZER_STABLE_DELAY) -> bool:
-    """
-    Check that the file size remains unchanged over a short interval.
-    """
+def utc_output_path(
+    local_path: Path,
+) -> Path:
+
+    local_dt = parse_local_timestamp(
+        local_path
+    )
+
+    utc_dt = local_dt.astimezone(
+        timezone.utc
+    )
+
+    return ARCHIVE_DIR / (
+        f"GreenDayTV_"
+        f"{utc_dt:%Y-%m-%d_%H-%M-%S}.mkv"
+    )
+
+
+# ============================================================
+# File stability
+# ============================================================
+
+def is_file_stable(
+    path: Path,
+) -> bool:
 
     try:
+
         size1 = path.stat().st_size
-        time.sleep(delay)
+
+        time.sleep(
+            FINALIZER_STABLE_DELAY
+        )
+
         size2 = path.stat().st_size
-    except (FileNotFoundError, PermissionError):
+
+    except (
+        FileNotFoundError,
+        PermissionError,
+    ):
+
         return False
 
     return size1 == size2
+
+
+def is_old_enough(
+    path: Path,
+) -> bool:
+
+    try:
+
+        age = (
+            time.time()
+            - path.stat().st_mtime
+        )
+
+    except (
+        FileNotFoundError,
+        PermissionError,
+    ):
+
+        return False
+
+    return (
+        age >= FINALIZE_MIN_AGE_SECONDS
+    )
+
+
+# ============================================================
+# Bounded byte queue
+# ============================================================
+
+class BufferedByteQueue:
+
+    def __init__(
+        self,
+        max_bytes: int,
+    ):
+
+        self.max_bytes = max_bytes
+
+        self._condition = (
+            threading.Condition()
+        )
+
+        self._chunks: deque[bytes] = (
+            deque()
+        )
+
+        self._bytes = 0
+
+        self._closed = False
+
+        self._aborted = False
+
+    def put(
+        self,
+        data: bytes,
+    ) -> bool:
+
+        if not data:
+            return True
+
+        with self._condition:
+
+            while (
+                not self._aborted
+                and not self._closed
+                and (
+                    self._bytes
+                    + len(data)
+                    > self.max_bytes
+                )
+            ):
+
+                self._condition.wait(
+                    timeout=1.0
+                )
+
+            if (
+                self._aborted
+                or self._closed
+            ):
+                return False
+
+            self._chunks.append(
+                data
+            )
+
+            self._bytes += len(data)
+
+            self._condition.notify_all()
+
+            return True
+
+    def get(self):
+
+        with self._condition:
+
+            while (
+                not self._chunks
+                and not self._aborted
+                and not self._closed
+            ):
+
+                self._condition.wait(
+                    timeout=1.0
+                )
+
+            if self._aborted:
+                return None
+
+            if self._chunks:
+
+                data = (
+                    self._chunks.popleft()
+                )
+
+                self._bytes -= len(data)
+
+                self._condition.notify_all()
+
+                return data
+
+            return None
+
+    def close(self) -> None:
+
+        with self._condition:
+
+            self._closed = True
+
+            self._condition.notify_all()
+
+    def abort(self) -> None:
+
+        with self._condition:
+
+            self._aborted = True
+
+            self._chunks.clear()
+
+            self._bytes = 0
+
+            self._condition.notify_all()
+
+    def bytes_available(self) -> int:
+
+        with self._condition:
+            return self._bytes
+
+    def fraction_full(self) -> float:
+
+        with self._condition:
+
+            return (
+                self._bytes
+                / self.max_bytes
+            )
 
 
 # ============================================================
 # Finalization
 # ============================================================
 
-FINALIZER_RE = re.compile(
-    r"^GreenDayTV_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.local\.mkv$"
-)
-
-
-def get_active_segment() -> Path | None:
-    with ACTIVE_SEGMENT_LOCK:
-        return ACTIVE_SEGMENT
-
-
-def set_active_segment(path: Path | None) -> None:
-    global ACTIVE_SEGMENT
-
-    with ACTIVE_SEGMENT_LOCK:
-        ACTIVE_SEGMENT = path
-
-
-def finalise_segment(path: Path) -> None:
-    """
-    Convert one completed .local.mkv into its final UTC-named MKV.
-
-    The media itself is copied bit-for-bit; no re-encoding.
-    """
+def finalise_segment(
+    path: Path,
+) -> None:
 
     if not path.exists():
         return
 
     active = get_active_segment()
 
-    if active is not None and path.resolve() == active.resolve():
+    if active is not None:
+
+        try:
+
+            if (
+                path.resolve()
+                == active.resolve()
+            ):
+                return
+
+        except FileNotFoundError:
+
+            return
+
+    if not is_old_enough(path):
         return
 
     if not is_file_stable(path):
@@ -340,52 +732,92 @@ def finalise_segment(path: Path) -> None:
 
     output = utc_output_path(path)
 
-    # Nothing to do if this exact final file already exists.
+    # --------------------------------------------------------
+    # Already finalized.
+    #
+    # Do not remux again. Just remove the old source if possible.
+    # --------------------------------------------------------
+
     if output.exists():
+
         try:
+
             path.unlink()
+
             log.info(
                 "Removed duplicate local segment: %s",
                 path.name,
             )
+
         except PermissionError:
+
             log.warning(
-                "Could not remove duplicate local segment yet: %s",
+                "Final file already exists but "
+                "source is still locked: %s",
                 path.name,
             )
 
         return
 
-    temporary_output = output.with_suffix(
-        output.suffix + FINALIZE_TEMP_SUFFIX
+    temporary_output = (
+        output.with_suffix(
+            output.suffix
+            + FINALIZE_TEMP_SUFFIX
+        )
     )
 
     try:
-        if temporary_output.exists():
-            temporary_output.unlink()
 
-        local_dt = parse_local_timestamp(path)
-        utc_dt = local_dt.astimezone(timezone.utc)
+        if temporary_output.exists():
+
+            try:
+
+                temporary_output.unlink()
+
+            except PermissionError:
+
+                return
+
+        local_dt = parse_local_timestamp(
+            path
+        )
+
+        utc_dt = local_dt.astimezone(
+            timezone.utc
+        )
 
         comment = (
             "Green Day TV archive segment; "
-            f"source local time {local_dt.isoformat()}; "
-            f"UTC start {utc_dt.isoformat()}"
+            f"source local time "
+            f"{local_dt.isoformat()}; "
+            f"UTC start "
+            f"{utc_dt.isoformat()}"
         )
 
         command = [
+
             FFMPEG,
+
             "-hide_banner",
             "-loglevel", "warning",
+            "-nostdin",
             "-y",
-            "-i", str(path),
+
+            "-i",
+            str(path),
 
             "-map", "0",
 
             "-c", "copy",
 
-            "-metadata", f"comment={comment}",
-            "-metadata", f"creation_time={utc_dt.isoformat()}",
+            "-metadata",
+            f"comment={comment}",
+
+            "-metadata",
+            (
+                "creation_time="
+                f"{utc_dt.isoformat()}"
+            ),
 
             str(temporary_output),
         ]
@@ -398,124 +830,159 @@ def finalise_segment(path: Path) -> None:
 
         result = subprocess.run(
             command,
+
             stdin=subprocess.DEVNULL,
+
             stdout=subprocess.DEVNULL,
+
             stderr=subprocess.PIPE,
+
             text=True,
+
             encoding="utf-8",
+
             errors="replace",
+
+            creationflags=(
+                get_process_creation_flags(
+                    "below"
+                )
+            ),
         )
 
         if result.returncode != 0:
+
             log.warning(
-                "Finalization failed for %s (FFmpeg exit %s): %s",
+                "Finalization failed for %s "
+                "(FFmpeg exit %s): %s",
                 path.name,
                 result.returncode,
                 result.stderr.strip(),
             )
 
-            try:
-                temporary_output.unlink(missing_ok=True)
-            except PermissionError:
-                pass
+            temporary_output.unlink(
+                missing_ok=True
+            )
 
             return
 
-        # Do not delete the source until FFmpeg successfully
-        # produced the finalized file.
+        # ----------------------------------------------------
+        # The final output is complete.
         #
-        # On Windows, an open file can produce WinError 32.
-        # Treat that as a transient condition rather than killing
-        # the finalizer thread.
+        # Rename it FIRST.
+        #
+        # Deleting the source is only housekeeping and must
+        # never destroy an already successful final output.
+        # ----------------------------------------------------
+
+        temporary_output.replace(
+            output
+        )
+
         try:
+
             path.unlink()
+
+            log.info(
+                "Finalized successfully: %s",
+                output.name,
+            )
+
         except PermissionError:
+
             log.warning(
-                "Source still locked; will retry finalization later: %s",
+                "Finalized successfully but "
+                "source is still locked; "
+                "it will be removed on a later scan: %s",
                 path.name,
             )
 
-            try:
-                temporary_output.unlink(missing_ok=True)
-            except PermissionError:
-                pass
-
-            return
-
-        temporary_output.replace(output)
-
-        log.info(
-            "Finalized successfully: %s",
-            output.name,
-        )
-
     except FileNotFoundError:
-        # File may have disappeared because another cleanup operation
-        # handled it.
+
         return
 
     except PermissionError as exc:
+
         log.warning(
-            "File temporarily locked during finalization of %s: %s",
+            "File temporarily locked while "
+            "finalizing %s: %s",
             path.name,
             exc,
         )
 
         try:
-            temporary_output.unlink(missing_ok=True)
+
+            temporary_output.unlink(
+                missing_ok=True
+            )
+
         except PermissionError:
             pass
 
     except Exception:
+
         log.exception(
-            "Unexpected finalization error for %s",
+            "Unexpected finalization error "
+            "for %s",
             path.name,
         )
 
 
-def segment_finaliser_loop() -> None:
-    log.info("Segment finalizer thread started.")
+def segment_finalizer_loop() -> None:
+
+    log.info(
+        "Segment finalizer thread started."
+    )
 
     while not SHUTDOWN_EVENT.is_set():
 
         try:
+
             paths = sorted(
                 (
                     p
                     for p in ARCHIVE_DIR.glob(
                         "GreenDayTV_*.local.mkv"
                     )
-                    if FINALIZER_RE.match(p.name)
+                    if FINALIZER_RE.match(
+                        p.name
+                    )
                 ),
                 key=lambda p: p.stat().st_mtime,
             )
 
-            active = get_active_segment()
-
+            # Only one file per scan.
+            #
+            # The live recorder always gets priority.
             for path in paths:
 
                 if SHUTDOWN_EVENT.is_set():
                     break
 
-                if active is not None:
-                    try:
-                        if path.resolve() == active.resolve():
-                            continue
-                    except FileNotFoundError:
-                        continue
+                if not is_old_enough(path):
+                    continue
 
                 finalise_segment(path)
 
+                break
+
         except Exception:
-            log.exception("Error in segment finalizer loop.")
 
-        SHUTDOWN_EVENT.wait(FINALIZER_INTERVAL)
+            log.exception(
+                "Error in segment finalizer loop."
+            )
 
-    log.info("Segment finalizer thread stopped.")
+        SHUTDOWN_EVENT.wait(
+            FINALIZER_SCAN_INTERVAL
+        )
+
+    log.info(
+        "Segment finalizer thread stopped."
+    )
 
 
 # ============================================================
-# yt-dlp stderr reader
+# yt-dlp stderr
 # ============================================================
 
 def read_ytdlp_stderr(
@@ -523,53 +990,268 @@ def read_ytdlp_stderr(
 ) -> None:
 
     try:
+
         for raw_line in process.stderr:
+
             if SHUTDOWN_EVENT.is_set():
                 break
 
-            line = raw_line.rstrip()
+            if isinstance(
+                raw_line,
+                bytes,
+            ):
+
+                line = raw_line.decode(
+                    "utf-8",
+                    errors="replace",
+                ).rstrip()
+
+            else:
+
+                line = raw_line.rstrip()
 
             if line:
-                log.info("[yt-dlp] %s", line)
+
+                log.info(
+                    "[yt-dlp] %s",
+                    line,
+                )
 
     except Exception:
-        log.exception("yt-dlp stderr reader failed.")
+
+        if not SHUTDOWN_EVENT.is_set():
+
+            log.exception(
+                "yt-dlp stderr reader failed."
+            )
 
 
 # ============================================================
-# Run one recording session
+# yt-dlp stdout
+# ============================================================
+
+def read_ytdlp_stdout(
+    process: subprocess.Popen,
+    media_buffer: BufferedByteQueue,
+) -> None:
+
+    try:
+
+        while not SHUTDOWN_EVENT.is_set():
+
+            data = process.stdout.read(
+                BUFFER_CHUNK_SIZE
+            )
+
+            if not data:
+                break
+
+            note_source_bytes(
+                len(data)
+            )
+
+            if not media_buffer.put(
+                data
+            ):
+                break
+
+    except Exception:
+
+        if not SHUTDOWN_EVENT.is_set():
+
+            log.exception(
+                "yt-dlp stdout reader failed."
+            )
+
+    finally:
+
+        media_buffer.close()
+
+
+# ============================================================
+# Archive FFmpeg stderr
+# ============================================================
+
+def read_archive_ffmpeg_stderr(
+    process: subprocess.Popen,
+) -> None:
+
+    try:
+
+        for raw_line in process.stderr:
+
+            if isinstance(
+                raw_line,
+                bytes,
+            ):
+
+                line = raw_line.decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+
+            else:
+
+                line = raw_line.strip()
+
+            if line:
+
+                log.warning(
+                    "[archive-ffmpeg] %s",
+                    line,
+                )
+
+    except Exception:
+
+        if not SHUTDOWN_EVENT.is_set():
+
+            log.exception(
+                "Archive FFmpeg stderr reader "
+                "failed."
+            )
+
+
+# ============================================================
+# Archive FFmpeg writer
+# ============================================================
+
+def write_buffer_to_ffmpeg(
+    ffmpeg: subprocess.Popen,
+    media_buffer: BufferedByteQueue,
+) -> None:
+
+    try:
+
+        while not SHUTDOWN_EVENT.is_set():
+
+            data = media_buffer.get()
+
+            if data is None:
+                break
+
+            try:
+
+                ffmpeg.stdin.write(
+                    data
+                )
+
+            except (
+                BrokenPipeError,
+                OSError,
+            ):
+
+                break
+
+            note_archive_bytes(
+                len(data)
+            )
+
+    except Exception:
+
+        if not SHUTDOWN_EVENT.is_set():
+
+            log.exception(
+                "Archive FFmpeg writer failed."
+            )
+
+    finally:
+
+        try:
+            ffmpeg.stdin.close()
+
+        except Exception:
+            pass
+
+
+# ============================================================
+# Process shutdown
+# ============================================================
+
+def stop_process(
+    process: subprocess.Popen,
+    name: str,
+    timeout: float,
+) -> None:
+
+    try:
+
+        if process.poll() is not None:
+            return
+
+        process.terminate()
+
+        try:
+
+            process.wait(
+                timeout=timeout
+            )
+
+            return
+
+        except subprocess.TimeoutExpired:
+
+            pass
+
+        log.warning(
+            "%s did not terminate cleanly; "
+            "killing it.",
+            name,
+        )
+
+        process.kill()
+
+        try:
+
+            process.wait(timeout=5)
+
+        except subprocess.TimeoutExpired:
+
+            pass
+
+    except Exception:
+
+        log.exception(
+            "Error stopping %s.",
+            name,
+        )
+
+
+# ============================================================
+# Recording session
 # ============================================================
 
 def run_recording() -> bool:
-    """
-    Run yt-dlp + FFmpeg until the stream/session dies.
 
-    Returns:
-        True  = recording produced media successfully
-        False = startup failed before media was received
-    """
+    reset_media_stats()
 
-    global ACTIVE_SEGMENT
+    media_buffer = BufferedByteQueue(
+        BUFFER_MAX_BYTES
+    )
 
     log.info("")
-    log.info("==============================================")
-    log.info("Starting recording session")
-    log.info("==============================================")
+    log.info(
+        "=============================================="
+    )
+    log.info(
+        "Starting recording session"
+    )
+    log.info(
+        "=============================================="
+    )
 
     # --------------------------------------------------------
-    # yt-dlp command
+    # yt-dlp
     # --------------------------------------------------------
 
     ytdlp_command = [
+
         YTDLP,
 
         "--no-playlist",
 
-        # Explicit dynamic format selection.
         "-f",
         FORMAT_SELECTOR,
 
-        # yt-dlp's FFmpeg downloader for HLS.
         "--downloader",
         "ffmpeg",
 
@@ -584,7 +1266,14 @@ def run_recording() -> bool:
         "--retry-sleep",
         "exp=1:5",
 
-        # Stream media to stdout.
+        "--downloader-args",
+        (
+            "ffmpeg_i:"
+            "-reconnect 1 "
+            "-reconnect_streamed 1 "
+            "-reconnect_delay_max 5"
+        ),
+
         "-o",
         "-",
 
@@ -592,7 +1281,17 @@ def run_recording() -> bool:
     ]
 
     # --------------------------------------------------------
-    # FFmpeg command
+    # Archive FFmpeg
+    # --------------------------------------------------------
+    #
+    # The important part is:
+    #
+    #   -segment_atclocktime 1
+    #
+    # This makes the hourly boundaries depend on wall clock,
+    # not on the HLS timestamps.
+    #
+    # This is the key fix for the hundreds of tiny files.
     # --------------------------------------------------------
 
     output_template = ARCHIVE_DIR / (
@@ -600,10 +1299,12 @@ def run_recording() -> bool:
     )
 
     ffmpeg_command = [
+
         FFMPEG,
 
         "-hide_banner",
         "-loglevel", "warning",
+        "-nostdin",
 
         "-i",
         "pipe:0",
@@ -619,6 +1320,12 @@ def run_recording() -> bool:
         "-segment_time",
         str(SEGMENT_SECONDS),
 
+        "-segment_atclocktime",
+        "1",
+
+        "-min_seg_duration",
+        "300",
+
         "-reset_timestamps",
         "1",
 
@@ -631,277 +1338,458 @@ def run_recording() -> bool:
         str(output_template),
     ]
 
-    log.info("Starting yt-dlp...")
-    log.info("Format selector: %s", FORMAT_SELECTOR)
+    log.info(
+        "Format selector: %s",
+        FORMAT_SELECTOR,
+    )
+
+    log.info(
+        "RAM media buffer: %.1f MiB",
+        BUFFER_MAX_BYTES
+        / (1024 ** 2),
+    )
+
+    log.info(
+        "Startup timeout: %s seconds",
+        STARTUP_TIMEOUT_SECONDS,
+    )
+
+    log.info(
+        "Source stall timeout: %s seconds",
+        SOURCE_STALL_SECONDS,
+    )
 
     try:
+
         ytdlp = subprocess.Popen(
             ytdlp_command,
+
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+
             stdin=subprocess.DEVNULL,
+
             bufsize=0,
+
+            creationflags=(
+                get_process_creation_flags(
+                    "above"
+                )
+            ),
         )
+
     except Exception:
-        log.exception("Failed to start yt-dlp.")
+
+        log.exception(
+            "Failed to start yt-dlp."
+        )
+
         return False
 
-    log.info("Starting FFmpeg...")
-
     try:
+
         ffmpeg = subprocess.Popen(
             ffmpeg_command,
-            stdin=ytdlp.stdout,
+
+            stdin=subprocess.PIPE,
+
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-    except Exception:
-        log.exception("Failed to start FFmpeg.")
 
-        try:
-            ytdlp.kill()
-        except Exception:
-            pass
+            bufsize=0,
+
+            creationflags=(
+                get_process_creation_flags(
+                    "above"
+                )
+            ),
+        )
+
+    except Exception:
+
+        log.exception(
+            "Failed to start archive FFmpeg."
+        )
+
+        stop_process(
+            ytdlp,
+            "yt-dlp",
+            8,
+        )
 
         return False
 
-    # Parent no longer needs its copy of this descriptor.
-    try:
-        ytdlp.stdout.close()
-    except Exception:
-        pass
-
     # --------------------------------------------------------
-    # yt-dlp stderr monitoring
+    # Threads
     # --------------------------------------------------------
 
-    stderr_thread = threading.Thread(
-        target=read_ytdlp_stderr,
-        args=(ytdlp,),
+    stdout_thread = threading.Thread(
+        target=read_ytdlp_stdout,
+        args=(
+            ytdlp,
+            media_buffer,
+        ),
+        name="yt-dlp-stdout-reader",
         daemon=True,
     )
 
-    stderr_thread.start()
+    ytdlp_stderr_thread = threading.Thread(
+        target=read_ytdlp_stderr,
+        args=(ytdlp,),
+        name="yt-dlp-stderr-reader",
+        daemon=True,
+    )
 
-    # --------------------------------------------------------
-    # Monitor actual segment creation / file growth.
-    #
-    # This is deliberately NOT based on yt-dlp's textual
-    # "time=" progress output. The actual media pipeline is
-    # what matters.
-    # --------------------------------------------------------
+    writer_thread = threading.Thread(
+        target=write_buffer_to_ffmpeg,
+        args=(
+            ffmpeg,
+            media_buffer,
+        ),
+        name="ffmpeg-buffer-writer",
+        daemon=True,
+    )
+
+    ffmpeg_stderr_thread = threading.Thread(
+        target=read_archive_ffmpeg_stderr,
+        args=(ffmpeg,),
+        name="ffmpeg-stderr-reader",
+        daemon=True,
+    )
+
+    stdout_thread.start()
+
+    ytdlp_stderr_thread.start()
+
+    writer_thread.start()
+
+    ffmpeg_stderr_thread.start()
 
     session_start = time.monotonic()
 
-    media_seen = False
-    last_total_size = 0
-    last_growth_time = session_start
+    last_buffer_log = session_start
+
+    last_source_bytes = 0
+
+    # --------------------------------------------------------
+    # Monitoring
+    # --------------------------------------------------------
 
     while not SHUTDOWN_EVENT.is_set():
 
-        # ----------------------------------------------------
-        # Check processes
-        # ----------------------------------------------------
-
-        ytdlp_returncode = ytdlp.poll()
-        ffmpeg_returncode = ffmpeg.poll()
-
-        if ffmpeg_returncode is not None:
-            log.error(
-                "FFmpeg exited with return code %s.",
-                ffmpeg_returncode,
-            )
-            break
-
-        if ytdlp_returncode is not None:
-            log.warning(
-                "yt-dlp exited with return code %s.",
-                ytdlp_returncode,
-            )
-            break
-
-        # ----------------------------------------------------
-        # Discover current local segments.
-        # ----------------------------------------------------
-
-        try:
-            local_files = sorted(
-                ARCHIVE_DIR.glob(
-                    "GreenDayTV_*.local.mkv"
-                ),
-                key=lambda p: p.stat().st_mtime,
-            )
-
-            if local_files:
-                current = local_files[-1]
-
-                set_active_segment(current)
-
-                total_size = sum(
-                    p.stat().st_size
-                    for p in local_files
-                    if p.exists()
-                )
-
-                now = time.monotonic()
-
-                if total_size > last_total_size:
-                    media_seen = True
-                    last_total_size = total_size
-                    last_growth_time = now
-
-        except FileNotFoundError:
-            pass
-
-        # ----------------------------------------------------
-        # Startup timeout
-        # ----------------------------------------------------
-
         now = time.monotonic()
 
+        ytdlp_rc = ytdlp.poll()
+
+        ffmpeg_rc = ffmpeg.poll()
+
+        if ffmpeg_rc is not None:
+
+            log.error(
+                "Archive FFmpeg exited with "
+                "return code %s.",
+                ffmpeg_rc,
+            )
+
+            break
+
+        if ytdlp_rc is not None:
+
+            log.warning(
+                "yt-dlp exited with "
+                "return code %s.",
+                ytdlp_rc,
+            )
+
+            break
+
+        (
+            source_bytes,
+            archive_bytes,
+            last_source_data,
+            media_seen,
+        ) = get_media_stats()
+
+        # ----------------------------------------------------
+        # Periodic pipeline status
+        # ----------------------------------------------------
+
+        if (
+            now - last_buffer_log
+            >= BUFFER_LOG_INTERVAL_SECONDS
+        ):
+
+            log.info(
+                "Pipeline status: "
+                "source=%.2f MiB, "
+                "archive=%.2f MiB, "
+                "buffer=%.1f MiB (%.0f%%)",
+                source_bytes
+                / (1024 ** 2),
+
+                archive_bytes
+                / (1024 ** 2),
+
+                media_buffer.bytes_available()
+                / (1024 ** 2),
+
+                media_buffer.fraction_full()
+                * 100,
+            )
+
+            last_buffer_log = now
+
+            last_source_bytes = (
+                source_bytes
+            )
+
+        # ----------------------------------------------------
+        # Startup
+        # ----------------------------------------------------
+
         if not media_seen:
+
             if (
                 now - session_start
                 >= STARTUP_TIMEOUT_SECONDS
             ):
+
                 log.error(
-                    "No media data received within %s seconds.",
+                    "No media bytes received from "
+                    "yt-dlp within %s seconds.",
                     STARTUP_TIMEOUT_SECONDS,
                 )
+
                 break
 
         # ----------------------------------------------------
-        # Media stall timeout
+        # Source stall
         # ----------------------------------------------------
 
         elif (
-            now - last_growth_time
-            >= STALL_SECONDS
+            now - last_source_data
+            >= SOURCE_STALL_SECONDS
         ):
+
             log.error(
-                "Media output has not grown for %s seconds.",
-                STALL_SECONDS,
+                "No new media bytes have arrived "
+                "from yt-dlp for %s seconds.",
+                SOURCE_STALL_SECONDS,
             )
+
             break
+
+        # ----------------------------------------------------
+        # Disk space
+        # ----------------------------------------------------
+
+        if (
+            int(now - session_start) % 60
+            == 0
+        ):
+
+            try:
+
+                free_gb = free_space_gb(
+                    ARCHIVE_DIR
+                )
+
+                if free_gb < MIN_FREE_GB:
+
+                    log.error(
+                        "Free disk space has fallen "
+                        "below %.2f GB. "
+                        "Stopping archiver.",
+                        MIN_FREE_GB,
+                    )
+
+                    break
+
+            except Exception:
+
+                log.exception(
+                    "Unable to check free disk space."
+                )
 
         time.sleep(1.0)
 
-    # --------------------------------------------------------
-    # Shut down session
-    # --------------------------------------------------------
+    # ========================================================
+    # Session shutdown
+    # ========================================================
 
-    log.info("Stopping recording session...")
+    log.info(
+        "Stopping recording session..."
+    )
 
-    # Close FFmpeg input by terminating yt-dlp first.
-    try:
-        if ytdlp.poll() is None:
-            ytdlp.terminate()
-    except Exception:
-        pass
+    # Stop the source first.
+    stop_process(
+        ytdlp,
+        "yt-dlp",
+        8,
+    )
 
-    # Give yt-dlp a moment to terminate cleanly.
-    try:
-        ytdlp.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
-            ytdlp.kill()
-        except Exception:
-            pass
+    # Let the stdout reader finish and close the buffer.
+    media_buffer.close()
 
-    # FFmpeg should then see EOF on stdin.
-    try:
-        ffmpeg.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        log.warning(
-            "FFmpeg did not exit cleanly; terminating it."
-        )
+    stdout_thread.join(
+        timeout=5
+    )
 
-        try:
-            ffmpeg.terminate()
-        except Exception:
-            pass
+    # Let the archive writer drain buffered bytes.
+    writer_thread.join(
+        timeout=15
+    )
 
-        try:
-            ffmpeg.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                ffmpeg.kill()
-            except Exception:
-                pass
+    # FFmpeg receives EOF after stdin is closed by writer_thread.
+    stop_process(
+        ffmpeg,
+        "archive FFmpeg",
+        15,
+    )
 
-    # The current segment is no longer active once FFmpeg has
-    # definitely exited. At this point the finalizer may process it.
-    set_active_segment(None)
+    ytdlp_stderr_thread.join(
+        timeout=2
+    )
 
-    # Drain/finish stderr reader.
-    try:
-        stderr_thread.join(timeout=2)
-    except Exception:
-        pass
+    ffmpeg_stderr_thread.join(
+        timeout=2
+    )
+
+    set_active_segment(
+        None
+    )
+
+    (
+        source_bytes,
+        archive_bytes,
+        _last_source_data,
+        media_seen,
+    ) = get_media_stats()
+
+    log.info(
+        "Session totals: "
+        "%.2f MiB received, "
+        "%.2f MiB sent to archive FFmpeg.",
+        source_bytes / (1024 ** 2),
+        archive_bytes / (1024 ** 2),
+    )
 
     if media_seen:
-        log.info("Recording session ended after receiving media.")
+
+        log.info(
+            "Recording session ended after "
+            "receiving media."
+        )
+
         return True
 
-    log.warning("Recording session ended without receiving media.")
+    log.warning(
+        "Recording session ended without "
+        "receiving media."
+    )
+
     return False
 
 
 # ============================================================
-# Main loop
+# Main
 # ============================================================
 
 def main() -> None:
+
     if not YTDLP:
+
         raise RuntimeError(
             "yt-dlp executable was not found in PATH."
         )
 
     if not FFMPEG:
+
         raise RuntimeError(
             "FFmpeg executable was not found in PATH."
         )
 
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     mutex_handle = acquire_single_instance()
 
     if mutex_handle is None:
+
         log.error(
-            "Another Green Day TV archiver instance is already running."
+            "Another Green Day TV archiver instance "
+            "is already running."
         )
-        log.error(
-            "This instance will now exit."
-        )
+
         return
 
+    finalizer_thread = None
+
     try:
-        log.info("yt-dlp version:")
+
+        # ----------------------------------------------------
+        # Version and process identity
+        # ----------------------------------------------------
 
         try:
-            version_result = subprocess.run(
-                [YTDLP, "--version"],
+
+            result = subprocess.run(
+                [
+                    YTDLP,
+                    "--version",
+                ],
+
                 capture_output=True,
+
                 text=True,
+
                 encoding="utf-8",
+
                 errors="replace",
+
                 timeout=10,
             )
 
-            version = version_result.stdout.strip()
+            version = (
+                result.stdout.strip()
+            )
 
             if version:
-                log.info("%s", version)
+
+                log.info(
+                    "yt-dlp version: %s",
+                    version,
+                )
 
         except Exception:
+
             log.warning(
                 "Could not determine yt-dlp version."
             )
 
-        log.info("==============================================")
-        log.info("Green Day TV archiver")
-        log.info("==============================================")
+        log.info(
+            "Archiver PID: %s",
+            os.getpid(),
+        )
+
+        log.info(
+            "Active log file: %s",
+            LOG_FILE.resolve(),
+        )
+
+        log.info(
+            "=============================================="
+        )
+
+        log.info(
+            "Green Day TV archiver"
+        )
+
+        log.info(
+            "=============================================="
+        )
 
         log.info(
             "Archive directory: %s",
@@ -919,16 +1807,20 @@ def main() -> None:
         )
 
         log.info(
-            "Target video: up to 1920x1080, H.264"
+            "Target video: up to 1920x1080 H.264"
         )
 
         log.info(
-            "Target audio: best available audio"
+            "Target audio: best available"
         )
 
         log.info(
             "Segment duration: %s seconds",
             SEGMENT_SECONDS,
+        )
+
+        log.info(
+            "Segmentation: wall-clock aligned"
         )
 
         log.info(
@@ -940,15 +1832,35 @@ def main() -> None:
         )
 
         log.info(
-            "Media stall timeout: %s seconds",
-            STALL_SECONDS,
+            "RAM media buffer: %.1f MiB",
+            BUFFER_MAX_BYTES
+            / (1024 ** 2),
+        )
+
+        log.info(
+            "Startup timeout: %s seconds",
+            STARTUP_TIMEOUT_SECONDS,
+        )
+
+        log.info(
+            "Source stall timeout: %s seconds",
+            SOURCE_STALL_SECONDS,
+        )
+
+        log.info(
+            "Finalization delay: %s seconds",
+            FINALIZE_MIN_AGE_SECONDS,
         )
 
         log.info("")
 
-        # Start finalizer.
+        # ----------------------------------------------------
+        # Finalizer
+        # ----------------------------------------------------
+
         finalizer_thread = threading.Thread(
-            target=segment_finaliser_loop,
+            target=segment_finalizer_loop,
+            name="segment-finalizer",
             daemon=True,
         )
 
@@ -960,9 +1872,11 @@ def main() -> None:
 
         while not SHUTDOWN_EVENT.is_set():
 
-            # Disk-space protection.
             try:
-                free_gb = free_space_gb(ARCHIVE_DIR)
+
+                free_gb = free_space_gb(
+                    ARCHIVE_DIR
+                )
 
                 log.info(
                     "Free disk space: %.2f GB",
@@ -970,14 +1884,18 @@ def main() -> None:
                 )
 
                 if free_gb < MIN_FREE_GB:
+
                     log.error(
-                        "Free disk space has fallen below "
-                        "%.2f GB. Stopping archiver.",
+                        "Free disk space has fallen "
+                        "below %.2f GB. "
+                        "Stopping archiver.",
                         MIN_FREE_GB,
                     )
+
                     break
 
             except Exception:
+
                 log.exception(
                     "Unable to check free disk space."
                 )
@@ -992,26 +1910,37 @@ def main() -> None:
                 RETRY_SECONDS,
             )
 
-            SHUTDOWN_EVENT.wait(RETRY_SECONDS)
+            SHUTDOWN_EVENT.wait(
+                RETRY_SECONDS
+            )
 
     except KeyboardInterrupt:
-        log.info("Keyboard interrupt received.")
+
+        log.info(
+            "Keyboard interrupt received."
+        )
 
     finally:
+
         SHUTDOWN_EVENT.set()
 
-        set_active_segment(None)
+        log.info(
+            "Shutdown requested..."
+        )
 
-        log.info("Shutdown requested...")
+        if finalizer_thread is not None:
 
-        try:
-            finalizer_thread.join(timeout=5)
-        except Exception:
-            pass
+            finalizer_thread.join(
+                timeout=5
+            )
 
-        release_single_instance(mutex_handle)
+        release_single_instance(
+            mutex_handle
+        )
 
-        log.info("Archiver stopped.")
+        log.info(
+            "Archiver stopped."
+        )
 
 
 # ============================================================
