@@ -16,7 +16,7 @@ from internetarchive import get_item
 # Directory containing the daily MKV files. Change this if necessary
 DAILY_DIR = Path(r"D:\Pietro\Archives\GreenDayTV\Daily")
 
-# Directory containing the source 1hr MKV files. Change this if necessary
+# Directory containing the source 1hr MKV files. Change this if necessary.
 # This is needed for automatic source-files deletion can be set to None if you want to delete the source files manually.
 # Note that the uploaded daily files will de deleted regardless.
 SOURCE_DIR = Path(r"D:\Pietro\Archives\GreenDayTV")
@@ -35,6 +35,7 @@ IA_IDENTIFIER_PREFIX = "green-day-tv"
 #     access=xxxxxxxxxxxxx
 #     secret=xxxxxxxxxxxxx
 #
+# Note: you can also pass this using "--acces-key [ACCESS_KEY]" and "--secret-key [SECRET_KEY]"
 IA_CREDENTIALS_FILE = Path(
     r"D:\Pietro\Archives\GreenDayTV\ia_api_keys.txt"
 )
@@ -42,6 +43,10 @@ IA_CREDENTIALS_FILE = Path(
 # Number of times to retry a failed upload.
 UPLOAD_RETRIES = 3
 
+# Seconds to wait after an upload to let the IA server update.
+# Default is 10 minutes (10 minutes * 60 seconds)
+# Please do not set this any lower than 8 minutes
+SERVE_UPDATE_DELAY = 10 * 60
 
 # Seconds to wait between upload retries.
 UPLOAD_RETRY_DELAY = 30
@@ -233,10 +238,10 @@ def upload_day(
 
                 verbose=True,
             )
+            del item # this instance of the item won't be needed anymore.
 
             if not responses:
                 print("Upload returned no response.")
-                f
 
             else:
                 failed = False
@@ -256,10 +261,13 @@ def upload_day(
 
                 if not failed:
                     print("Upload request completed.")
-
-                    # Refresh the item and verify the file exists.
+     
+                    # Give the internet archive server a bit of time to update
+                    time.sleep(SERVE_UPDATE_DELAY)
                     
+                    # Now refresh the item and verify the file exists.
                     item = get_item(identifier)
+
 
                     for remote_file in item.files:
                         print(remote_file.get("name"))
@@ -289,7 +297,7 @@ def upload_day(
         # ----------------------------------------------------
 
         if attempt < UPLOAD_RETRIES:
-            print("Waiting {UPLOAD_RETRY_DELAY} seconds before retrying...")
+            print(f"Waiting {UPLOAD_RETRY_DELAY} seconds before retrying...")
             time.sleep(UPLOAD_RETRY_DELAY)
 
     print("Upload failed after all retry attempts.")
@@ -300,7 +308,7 @@ def upload_day(
 # Main
 # ------------------------------------------------------------
 
-def main():
+def main(access_key=None, secret_key=None):
 
     if not DAILY_DIR.exists():
         raise RuntimeError(
@@ -311,8 +319,11 @@ def main():
     # --------------------------------------------------------
     # Load credentials
     # --------------------------------------------------------
+    
+    print(access_key, secret_key)
 
-    access_key, secret_key = (load_ia_credentials())
+    if not (access_key or secret_key):
+        access_key, secret_key = (load_ia_credentials())
 
     print("Internet Archive credentials loaded.")
 
@@ -376,4 +387,31 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from argparse import ArgumentParser
+    
+    parser = ArgumentParser(
+                prog='Green Day TV Archiver - Uploader',
+                description=(
+                    'This is the third component of the GDTV Archiver. '
+                    'It uploads stitched `daily files` to the Internet Archive.'
+                    )
+            )
+            
+    parser.add_argument(
+        '-a', '--access-key',
+        type=str,
+        required=False,
+        default="",
+        help="You Internet Archive S3-API Access Key"
+    ) 
+    parser.add_argument(
+        '-s', '--secret-key',
+        type=str,
+        required=False,
+        default="",
+        help="You Internet Archive S3-API Secret Key"
+    ) 
+    
+    args = parser.parse_args()
+    
+    main(args.access_key, args.secret_key)
