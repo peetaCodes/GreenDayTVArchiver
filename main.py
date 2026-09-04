@@ -38,6 +38,28 @@ ARCHIVER_SCRIPT = BASE_DIR / "green_day_tv_archiver.py"
 STITCHER_SCRIPT = BASE_DIR / "green_day_tv_stitcher.py"
 UPLOADER_SCRIPT = BASE_DIR / "green_day_tv_uploader.py"
 
+# Main config file
+# Format:
+#
+# [STITCHER]
+# local_rimezone=CONTINENT/CITY
+# [UPLOADER]
+# access=xxxxxx
+# secret=xxxxxx
+CONFIG_FILE = BASE_DIR / "gdtv_archiver_config.txt"
+
+CONFIG_FILE_PRESET = """[STITCHER]
+# Your local timezone. Needed to convert timestamps into UTC.
+# Needs to follow IANA format ('Continent/City', in english, replacing spaces with "_").
+# Examples: 'America/Los_Angeles', 'Europe/London', 'Asia/Tokyo'.
+local_timezone=Continent/City
+
+[UPLOADER]
+# Your Internet Archive S3 API Keys.
+# If you don't have them already, grab them at https://archive.org/developers/tutorial-get-ia-credentials.html
+access=xxxxxx
+secret=xxxxxx"""
+
 
 # How often the stitcher/uploader pipeline is run.
 #
@@ -145,12 +167,113 @@ def sleep_interruptibly(seconds: float):
 # Python subprocess environment
 # ------------------------------------------------------------
 
-def python_command(script: Path) -> list[str]:
-    return [
+def format_arg(variable_name: str):
+    return ("--" if len(variable_name) > 1 else "-") + variable_name.replace("_", "-")
+
+
+def python_command(script: Path, **kwargs) -> list[str]:
+    command = [
         sys.executable,
         str(script),
     ]
+    command += [x for arg, val in kwargs.items() for x in (format_arg(arg), str(val))]
+    
+    return command
 
+# ------------------------------------------------------------
+# Start archiver
+# ------------------------------------------------------------
+
+def make_new_config():
+    if CONFIG_FILE.exists():
+        if CONFIG_FILE.stat().st_size != 0:
+            proceed = input(f"WARNING: config file found at '{CONFIG_FILE}' and is not empty.\nOverwrite it? (y/N) ")
+            if proceed.lower() != "y":
+                print("Operation aborted by user.")
+                sys.exit(0)
+    
+        CONFIG_FILE.write_text(CONFIG_FILE_PRESET)
+  
+  
+def load_config():
+    config = {
+        "stitcher": {
+            "local_timezone": ""
+        },
+        "uploader": {
+            "access": "",
+            "secret": ""
+        }
+    }
+    
+    if not CONFIG_FILE.exists():
+        make_new_config()
+        raise RuntimeError(
+            (
+                f"GDTV Archiver master config file does not exist:\n{CONFIG_FILE}\n."
+                f"It's been now created with a blank preset. Please edit it with the proper information."
+            )
+        )
+    
+    current_conf = None
+    with CONFIG_FILE.open("r", encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+            
+            if not line:
+                continue
+                
+            if line.startswith("#"):
+                continue
+                
+            if line=="[STITCHER]":
+                current_conf = "stitcher"
+                continue
+                
+            if line=="[UPLOADER]":
+                current_conf = "uploader"
+                continue
+                
+            if "=" in line:
+                key, _, val = line.strip().partition("=")
+                
+                if current_conf == "stitcher" and key == "local_timezone":
+                    
+                    if config["stitcher"]["local_timezone"]: # Have we already collected this key?
+                        raise RuntimeError("The '[STITCHER]' section of the config file contains two or more 'local_timezone=' value. Exactly one is needed")
+                        
+                    config["stitcher"]["local_timezone"] = val
+                    
+                    
+                if current_conf == "uploader" and key == "access":
+                    
+                    if config["uploader"]["access"]: # Have we already collected this key?
+                        raise RuntimeError("The '[UPLOADER]' section of the config file contains two or more 'access=' value. Exactly one is needed")
+                        
+                    config["uploader"]["access"] = val
+                    
+                    
+                if current_conf == "uploader" and key == "secret":
+                    
+                    if config["uploader"]["secret"]: # Have we already collected this key?
+                        raise RuntimeError("The '[UPLOADER]' section of the config file contains two or more 'secret=' value. Exactly one is needed")
+                        
+                    config["uploader"]["secret"] = val
+                    
+                    
+    print(config)
+                    
+    if not all(config["stitcher"].values()) or not all(config["uploader"].values()):
+        raise RuntimeError(
+            (
+                f"The config file at '{CONFIG_FILE}' doesn't include every necessary key. "
+                f"The required format is:\n\n"
+                f"{CONFIG_FILE_PRESET}"
+            )
+        )
+        
+    return config
+    
 
 # ------------------------------------------------------------
 # Start archiver
@@ -335,7 +458,7 @@ def check_archiver():
 # Run stitcher
 # ------------------------------------------------------------
 
-def run_stitcher():
+def run_stitcher(config: dict):
     if not STITCHER_SCRIPT.exists():
         logging.error(
             "Stitcher script does not exist:\n%s",
@@ -356,7 +479,7 @@ def run_stitcher():
 
     try:
         result = subprocess.run(
-            python_command(STITCHER_SCRIPT),
+            python_command(STITCHER_SCRIPT, **config),
             stdin=subprocess.DEVNULL,
             stdout=None,
             stderr=None,
@@ -387,7 +510,7 @@ def run_stitcher():
 # Run uploader
 # ------------------------------------------------------------
 
-def run_uploader():
+def run_uploader(config: dict):
     if not UPLOADER_SCRIPT.exists():
         logging.error(
             "Uploader script does not exist:\n%s",
@@ -408,7 +531,7 @@ def run_uploader():
 
     try:
         result = subprocess.run(
-            python_command(UPLOADER_SCRIPT),
+            python_command(UPLOADER_SCRIPT, **config),
             stdin=subprocess.DEVNULL,
             stdout=None,
             stderr=None,
@@ -439,7 +562,7 @@ def run_uploader():
 # Run complete archive-maintenance cycle
 # ------------------------------------------------------------
 
-def run_pipeline():
+def run_pipeline(config: dict):
     """
     Stitch first, then upload.
 
@@ -460,14 +583,16 @@ def run_pipeline():
     logging.info(
         "############################################################"
     )
+    
+    0/0
 
-    stitcher_ok = run_stitcher()
+    stitcher_ok = run_stitcher(config["stitcher"])
 
     sleep_interruptibly(
         BETWEEN_PIPELINE_STEPS_SECONDS
     )
 
-    uploader_ok = run_uploader()
+    uploader_ok = run_uploader(config["uploader"])
 
     logging.info(
         "Archive maintenance cycle finished "
@@ -566,7 +691,9 @@ def main():
 
         if now >= next_pipeline:
 
-            run_pipeline()
+            run_pipeline(
+                load_config() # pass the loaded config file to the pipeline
+            )
 
             # Schedule from the END of the cycle rather than the
             # beginning. This prevents multiple cycles from piling
@@ -619,6 +746,30 @@ def main():
 # ------------------------------------------------------------
 
 if __name__ == "__main__":
+    from argparse import ArgumentParser
+    
+    parser = ArgumentParser(
+                prog='Green Day TV Archiver - Main',
+                description=(
+                    'This is main component of the GDTV Archiver.\n'
+                    'It orhcestrates the three components automatically. '
+                    'This is the only one you\'ll ever need to run.'
+                    )
+            )
+            
+    parser.add_argument(
+        '--new-config',
+        action="store_true",
+        help=(
+            f"When passed, the script will generate a new config file at '{CONFIG_FILE}'. "
+            f"WARNING: IF THE FILE ALREADY EXISTS IT WILL BE OVERWRITTEN."
+        )
+    )
+    
+    args = parser.parse_args()
+    if args.new_config:
+        make_new_config()
+            
     try:
         sys.exit(main())
 
