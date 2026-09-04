@@ -29,10 +29,32 @@ MKVMERGE = "mkvmerge"
 # Duration in seconds of every notice/warning inserted into the final stitched video.
 NOTICE_DURATION = 1.35
 
-# Significant gap threshold (ins seconds)
+# Significant gap threshold (in seconds)
 # If the script detects a gap between the archived footage
 # equal or longer than this value, it will insert a notice.
-SIGNIFICANT_GAP = 8
+SIGNIFICANT_GAP = NOTICE_DURATION
+
+# Significant missing footage threshold (in seconds)
+# If this many or more seconds of footage are missing for a day, include a warning.
+DAY_INCOMPLETE_GAP_THRESHOLD =  120
+
+# IANA timezone used by legacy files whose filenames contain
+# local time instead of an embedded UTC timestamp.
+#
+# The file contains just (ONE) the timezone name,
+# formed with `Continent/City`; in english (replacing spaces with underscores) for example:
+#
+# America/Los_Angeles
+# Europe/London
+# Asia/Tokyo
+# 
+# Note that only capitals or cities tied to a timezone are accepted.
+# So `America/Oakland` won't work but `America/San_Francisco` will.
+#
+# This is only used for backwards-compatible legacy files.
+LEGACY_TIMEZONE_CONFIG = (
+    ARCHIVE_DIR / "legacy_timezone.txt"
+)
 
 # This is deprecated and here only for backwards compatibility.
 # The script now calculates the timestamp using and embedded comment in the file.
@@ -272,7 +294,10 @@ def parse_filename(path: Path):
     )
 
 
-def probe_embedded_timestamp(path: Path):
+def probe_embedded_timestamp(
+    path: Path,
+) -> datetime | None:
+
     result = run([
         FFPROBE,
         "-v", "error",
@@ -281,43 +306,203 @@ def probe_embedded_timestamp(path: Path):
         str(path),
     ])
 
-    value = result.stdout.strip()
+    comment = result.stdout.strip()
 
-    if not value:
+    if not comment:
         return None
 
-    try:
-        timestamp = datetime.strptime(
-            value,
-            "%Y-%m-%dT%H:%M:%SZ",
+    # --------------------------------------------------------
+    # Extract ISO-8601 timestamps from the comment.
+    #
+    # Supported examples:
+    #
+    #   2026-08-30T10:44:24Z
+    #
+    #   2026-08-30T12:44:24+02:00
+    #
+    #   Green Day TV archive segment; source local time
+    #   2026-08-30T12:44:24+02:00;
+    #   UTC start 2026-08-30T10:44:24+00:00
+    #
+    # --------------------------------------------------------
+
+    matches = re.findall(
+        r"\d{4}-\d{2}-\d{2}T"
+        r"\d{2}:\d{2}:\d{2}"
+        r"(?:Z|[+-]\d{2}:\d{2})",
+        comment,
+    )
+
+    if not matches:
+        return None
+
+    # --------------------------------------------------------
+    # One timestamp:
+    # simply use it.
+    #
+    # Multiple timestamps:
+    # prefer the one explicitly marked as UTC (+00:00).
+    # --------------------------------------------------------
+
+    if len(matches) == 1:
+
+        value = matches[0]
+
+    else:
+
+        utc_matches = [
+            timestamp
+            for timestamp in matches
+            if timestamp.endswith("+00:00")
+        ]
+
+        if not utc_matches:
+            # Multiple timestamps but none explicitly marked
+            # as UTC. Fall back to the first one found.
+            value = matches[0]
+
+        else:
+            value = utc_matches[0]
+
+    # --------------------------------------------------------
+    # datetime.fromisoformat() understands both:
+    #
+    #   ...Z
+    #   ...+00:00
+    #   ...+02:00
+    #
+    # Normalize the result to UTC so callers always receive
+    # a UTC-aware datetime.
+    # --------------------------------------------------------
+
+    if value.endswith("Z"):
+        timestamp = datetime.fromisoformat(
+            value[:-1] + "+00:00"
+        )
+    else:
+        timestamp = datetime.fromisoformat(
+            value
         )
 
-        return timestamp.replace(
-            tzinfo=timezone.utc
-        )
+    return timestamp.astimezone(
+        timezone.utc
+    )
+    
 
-    except ValueError:
+def get_legacy_timezone(non_interactive=None, timezone_name=None):
+    """
+    Obtain the timezone used by legacy files.
+
+    Priority:
+    1. Use the passed argument or otherwise read it from LEGACY_TIMEZONE_CONFIG.
+    2. If the config file does not exist:
+       - ask the user when running interactively;
+       - raise an error when running non-interactively.
+
+    After a successful interactive entry, the timezone is saved
+    to the config file for future runs.
+    """
+    
+    if non_interactive is None:
+        non_interactive = False
+ 
+
+    # If no timezone was passed read the config file
+    if timezone_name is None:
+        if LEGACY_TIMEZONE_CONFIG.exists():
+            try:
+                timezone_name = (
+                    LEGACY_TIMEZONE_CONFIG
+                    .read_text(encoding="utf-8")
+                    .strip()
+                )
+
+            except OSError as exc:
+                raise RuntimeError(
+                    "Could not read legacy timezone configuration "
+                    f"{LEGACY_TIMEZONE_CONFIG}: {exc}"
+                )
+
+    if timezone_name: # In case the timezone had to be read from the config file, was anything read?
+        try:
+            return ZoneInfo(timezone_name)
+        except Exception:
+            raise RuntimeError(
+                "The legacy timezone configuration contains "
+                f"an invalid IANA timezone: {timezone_name!r}\n"
+                f"Please correct or delete: "
+                f"{LEGACY_TIMEZONE_CONFIG}"
+            )
+
+    # No usable configuration exists. And non_interactive = True: RuntimeError.
+    if non_interactive:
         raise RuntimeError(
-            f"Invalid embedded timestamp in {path}: {value!r}"
+            "Legacy files without embedded UTC timestamps were found, "
+            "but no valid legacy timezone configuration exists.\n"
+            f"Please create {LEGACY_TIMEZONE_CONFIG} containing the "
+            "IANA timezone used by those files, for example:\n"
+            "\n"
+            "America/Los_Angelse\nEurope/London\nAsia/Tokyo"
         )
 
+    # Interactive fallback.
 
-def get_source_segments():
+    while True:
+        timezone_name = input(
+            "Enter the IANA timezone used by these legacy files "
+            "(for example 'America/Los_Angeles', 'Europe/London', "
+            "'Europe/Rome'): "
+        ).strip()
+
+        try:
+            legacy_timezone = ZoneInfo(timezone_name)
+        except Exception:
+            print(
+                f"[ERROR] Invalid timezone: {timezone_name!r}. "
+                "Please enter a valid IANA timezone."
+            )
+            continue
+
+        # ----------------------------------------------------
+        # Save it so future runs do not ask again.
+        # ----------------------------------------------------
+
+        try:
+            LEGACY_TIMEZONE_CONFIG.write_text(
+                timezone_name + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(
+                f"[WARNING] Could not save timezone configuration "
+                f"to {LEGACY_TIMEZONE_CONFIG}: {exc}"
+            )
+
+        return legacy_timezone
+
+
+def get_source_segments(local_timezone=None, non_interactive=None):
+    if not non_interactive:
+        non_interactive = False
+        
     segments = []
     legacy_timezone = None
 
     for path in ARCHIVE_DIR.glob("GreenDayTV_*.mkv"):
         if path.name.endswith(".local.mkv"):
             continue
-            
+
         try:
             start = probe_embedded_timestamp(path)
             duration = probe_duration(path)
             media = probe_media_info(path)
-            
+
+            # ------------------------------------------------
             # Backwards compatibility:
             # fall back to the old filename timestamp if the
-            # embedded comment is missing or invalid.
+            # embedded comment is missing.
+            # ------------------------------------------------
+
             if start is None:
                 print(
                     f"[WARNING] No embedded timestamp comment found in "
@@ -325,31 +510,24 @@ def get_source_segments():
                 )
 
                 if legacy_timezone is None:
-                    while True:
-                        timezone_name = input(
-                            "Enter the IANA timezone used by these legacy "
-                            "files (for example 'America/Los_Angeles', 'Europe/London'...): "
-                        ).strip()
-
-                        try:
-                            legacy_timezone = ZoneInfo(timezone_name)
-                            break
-                        except Exception:
-                            print(
-                                f"[ERROR] Invalid timezone: {timezone_name!r}. "
-                                "Please enter a valid IANA timezone."
-                            )
+                    legacy_timezone = get_legacy_timezone(
+                        non_interactive=non_interactive,
+                        timezone_name=local_timezone
+                    )
 
                 start = parse_filename(path)
 
                 if start is None:
                     continue
 
+                # Filename timestamp is local time.
+                # Attach the user/configured legacy timezone,
+                # then convert it to UTC.
                 start = start.replace(
                     tzinfo=legacy_timezone
-                ).astimezone(timezone.utc)
-                
-                
+                ).astimezone(
+                    timezone.utc
+                )
 
         except (
             RuntimeError,
@@ -422,6 +600,7 @@ def split_by_day(segment: dict):
 
     return parts
 
+
 def build_day_segments(source_segments: list[dict]):
     days = {}
 
@@ -482,28 +661,77 @@ def source_quality_key(segment: dict, preferred_profile: dict):
     )
 
 
-def resolve_overlaps(segments: list[dict]):
-    if not segments:
+def resolve_overlaps(
+    segments: list[dict],
+    timeline_start: datetime,
+    timeline_end: datetime,
+):
+    """
+    Resolve overlapping footage while explicitly covering the
+    entire requested timeline.
+
+    Each resolved footage interval remains associated with its
+    actual source file.
+
+    Additionally, every footage interval receives:
+
+        run_start
+        run_end
+
+    which describe the complete continuous footage run that
+    interval belongs to, even when the run spans multiple files.
+    """
+
+    if timeline_end <= timeline_start:
         return []
 
     preferred_profile = get_preferred_output_profile(segments)
 
-    boundaries = sorted({
-        boundary
-        for segment in segments
-        for boundary in (segment["start"], segment["end"])
-    })
+    # --------------------------------------------------------
+    # Build all relevant boundaries.
+    # --------------------------------------------------------
+
+    boundaries = {
+        timeline_start,
+        timeline_end,
+    }
+
+    for segment in segments:
+        start = max(
+            segment["start"],
+            timeline_start,
+        )
+        end = min(
+            segment["end"],
+            timeline_end,
+        )
+
+        if end > start:
+            boundaries.add(start)
+            boundaries.add(end)
+
+    boundaries = sorted(boundaries)
 
     resolved = []
 
-    for left, right in zip(boundaries, boundaries[1:]):
+    # --------------------------------------------------------
+    # Classify every interval.
+    # --------------------------------------------------------
+
+    for left, right in zip(
+        boundaries,
+        boundaries[1:],
+    ):
         if right <= left:
             continue
 
         active = [
             segment
             for segment in segments
-            if segment["start"] <= left and segment["end"] >= right
+            if (
+                segment["start"] <= left
+                and segment["end"] >= right
+            )
         ]
 
         if not active:
@@ -516,7 +744,10 @@ def resolve_overlaps(segments: list[dict]):
 
         winner = max(
             active,
-            key=lambda s: source_quality_key(s, preferred_profile)
+            key=lambda s: source_quality_key(
+                s,
+                preferred_profile,
+            ),
         )
 
         resolved.append({
@@ -528,6 +759,10 @@ def resolve_overlaps(segments: list[dict]):
             "end": right,
             "media": winner["media"],
         })
+
+    # --------------------------------------------------------
+    # Merge adjacent intervals from the same source.
+    # --------------------------------------------------------
 
     merged = []
 
@@ -557,8 +792,47 @@ def resolve_overlaps(segments: list[dict]):
 
         merged.append(item)
 
+    # --------------------------------------------------------
+    # Annotate continuous footage runs.
+    #
+    # We deliberately keep different source files as separate
+    # timeline entries, but mark all contiguous entries with
+    # their common run_start/run_end.
+    # --------------------------------------------------------
+
+    index = 0
+
+    while index < len(merged):
+
+        if merged[index]["kind"] == "gap":
+            index += 1
+            continue
+
+        run_start = merged[index]["start"]
+        run_end = merged[index]["end"]
+
+        run_indices = [index]
+
+        next_index = index + 1
+
+        while (
+            next_index < len(merged)
+            and merged[next_index]["kind"] == "footage"
+            and merged[next_index]["start"] == run_end
+        ):
+            run_end = merged[next_index]["end"]
+            run_indices.append(next_index)
+            next_index += 1
+
+        for run_index in run_indices:
+            merged[run_index]["run_start"] = run_start
+            merged[run_index]["run_end"] = run_end
+
+        index = next_index
+
     return merged
 
+   
 
 # ============================================================
 # FFmpeg / MKV helpers
@@ -759,6 +1033,7 @@ def make_notice(text: str, output: Path, media: dict):
             f"FFmpeg failed while creating notice {output}"
         )
 
+
 def remux_for_mkvmerge(
     source: Path,
     output: Path,
@@ -837,74 +1112,220 @@ def build_mkvmerge_command(parts, output):
             command.extend(["+", str(part)])
 
     return command
-    
+  
+
+def write_ffmetadata_chapters(
+    chapter_entries,
+    output_path: Path,
+) -> None:
+    """
+    Write FFmpeg FFMETADATA chapters.
+
+    Each entry is:
+        (title, duration_seconds)
+
+    Durations are taken from the actual part files, so chapter
+    boundaries follow the assembled output rather than assuming
+    every generated file has exactly its nominal duration.
+    """
+
+    elapsed_ms = 0
+
+    with output_path.open(
+        "w",
+        encoding="utf-8",
+        newline="\n",
+    ) as f:
+
+        f.write(";FFMETADATA1\n")
+
+        for title, duration_seconds in chapter_entries:
+
+            duration_ms = max(
+                1,
+                round(duration_seconds * 1000),
+            )
+
+            start_ms = elapsed_ms
+
+            end_ms = (
+                elapsed_ms
+                + duration_ms
+            )
+
+            # FFmpeg metadata escaping.
+            safe_title = (
+                title
+                .replace("\\", "\\\\")
+                .replace("=", "\\=")
+                .replace(";", "\\;")
+                .replace("#", "\\#")
+            )
+
+            f.write("[CHAPTER]\n")
+            f.write("TIMEBASE=1/1000\n")
+            f.write(
+                f"START={start_ms}\n"
+            )
+            f.write(
+                f"END={end_ms}\n"
+            )
+            f.write(
+                f"title={safe_title}\n"
+            )
+            f.write("\n")
+
+            elapsed_ms = end_ms
+            
+  
 def concat_parts(
-    parts: list[Path],
-    output: Path,
-    work_dir: Path,
-    reference_media: dict,
-):
-    def build_command(inputs):
-        command = [
-            MKVMERGE,
-            "-o", str(output),
-        ]
+    parts,
+    output_path: Path,
+    chapter_entries,
+) -> None:
 
-        for index, part in enumerate(inputs):
-            if index == 0:
-                command.append(str(part))
-            else:
-                command.extend(["+", str(part)])
+    work_dir = output_path.parent / (
+        f".work_{output_path.stem}"
+    )
 
-        return command
+    work_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    concat_list = work_dir / "concat_list.txt"
+    chapter_metadata = work_dir / "chapters.ffmetadata"
 
     # --------------------------------------------------------
-    # First attempt: use every file exactly as it is.
+    # Build concat list
     # --------------------------------------------------------
 
-    command = build_command(parts)
-    result = run(command)
+    with concat_list.open(
+        "w",
+        encoding="utf-8",
+        newline="\n",
+    ) as f:
 
-    print(*command, sep=" ")
+        f.write("ffconcat version 1.0\n")
 
-    if result.returncode in (0, 1):
+        for part in parts:
+
+            # FFmpeg concat files use forward slashes.
+            path_string = (
+                part.resolve()
+                .as_posix()
+            )
+
+            f.write(
+                f"file '{path_string}'\n"
+            )
+
+    # --------------------------------------------------------
+    # Build chapter metadata
+    # --------------------------------------------------------
+
+    write_ffmetadata_chapters(
+        chapter_entries,
+        chapter_metadata,
+    )
+
+    # --------------------------------------------------------
+    # First concat attempt
+    # --------------------------------------------------------
+
+    command = [
+        FFMPEG,
+
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-nostdin",
+        "-y",
+
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_list),
+
+        "-f", "ffmetadata",
+        "-i", str(chapter_metadata),
+
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+
+        # Keep the normal metadata from the concatenated
+        # media input.
+        "-map_metadata", "0",
+
+        # Import chapters from the ffmetadata input.
+        "-map_chapters", "1",
+
+        "-c:v", "copy",
+        "-c:a", "copy",
+
+        str(output_path),
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    if result.returncode == 0:
         return
 
     # --------------------------------------------------------
-    # Find the files explicitly named in mkvmerge errors.
+    # Existing compatibility-repair logic
+    # --------------------------------------------------------
+    #
+    # Keep your current AAC probing/normalisation code here.
+    # The important change is that the RETRY command must also
+    # contain:
+    #
+    #     -f ffmetadata -i chapters.ffmetadata
+    #     -map_chapters 1
+    #
+    # and the final output must still use:
+    #
+    #     -c:v copy
+    #     -c:a copy
+    #
+    # for the already-normalised parts.
     # --------------------------------------------------------
 
-    failed_parts = find_failed_inputs(
-        result,
-        parts,
+    log.warning(
+        "Initial concat failed; checking parts for "
+        "incompatible media: %s",
+        result.stderr.strip(),
     )
 
-    if not failed_parts:
-        print(result.stdout)
-        print(result.stderr)
+    # Your existing repair logic should remain here.
+    current_parts = list(parts)
 
-        raise RuntimeError(
-            f"mkvmerge returned status {result.returncode}, "
-            "but no failing input file could be identified"
+    reference_media = None
+
+    for index, part in enumerate(current_parts):
+
+        media = probe_media(part)
+
+        if reference_media is None:
+            reference_media = media
+            continue
+
+        if media_is_compatible(
+            reference_media,
+            media,
+        ):
+            continue
+
+        repaired = work_dir / (
+            f"{index:04d}_repaired.mkv"
         )
 
-    print("mkvmerge rejected these input file(s):")
-
-    for part in failed_parts:
-        print(f"  {part}")
-
-    # --------------------------------------------------------
-    # Repair only files mkvmerge actually rejected.
-    # --------------------------------------------------------
-
-    repaired_parts = list(parts)
-
-    for part in failed_parts:
-        index = repaired_parts.index(part)
-
-        repaired = (
-            work_dir
-            / f"repair_{index:04d}.mkv"
+        log.warning(
+            "Normalizing incompatible part: %s",
+            part.name,
         )
 
         remux_for_mkvmerge(
@@ -913,27 +1334,76 @@ def concat_parts(
             reference_media,
         )
 
-        repaired_parts[index] = repaired
+        current_parts[index] = repaired
 
     # --------------------------------------------------------
-    # Try the final mux.
+    # Rebuild concat list after repairs
     # --------------------------------------------------------
 
-    command = build_command(
-        repaired_parts
+    with concat_list.open(
+        "w",
+        encoding="utf-8",
+        newline="\n",
+    ) as f:
+
+        f.write("ffconcat version 1.0\n")
+
+        for part in current_parts:
+
+            path_string = (
+                part.resolve()
+                .as_posix()
+            )
+
+            f.write(
+                f"file '{path_string}'\n"
+            )
+
+    # --------------------------------------------------------
+    # Retry concat, still importing chapters
+    # --------------------------------------------------------
+
+    command = [
+        FFMPEG,
+
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-nostdin",
+        "-y",
+
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_list),
+
+        "-f", "ffmetadata",
+        "-i", str(chapter_metadata),
+
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+
+        "-map_metadata", "0",
+        "-map_chapters", "1",
+
+        "-c:v", "copy",
+        "-c:a", "copy",
+
+        str(output_path),
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
-    result = run(command)
-
-    print(*command, sep=" ")
-
-    if result.returncode not in (0, 1):
-        print(result.stdout)
-        print(result.stderr)
+    if result.returncode != 0:
 
         raise RuntimeError(
-            "mkvmerge still failed after repairing "
-            f"{len(failed_parts)} file(s)"
+            "FFmpeg concat failed even after "
+            "media normalization:\n"
+            + result.stderr
         )
         
 
@@ -945,8 +1415,14 @@ def format_time(value):
     return value.strftime("%H:%M:%S")
 
 
-def format_delta(hours=0, minutes=0, seconds=0):
+def format_delta(hours=0, minutes=0, seconds=0, delta=None):
     parts = []
+    
+    if delta:
+        tot_seconds = delta.total_seconds()
+        hours = int(tot_seconds // 3600)
+        minutes = int((tot_seconds % 3600) // 60)
+        seconds = int(tot_seconds % 60)
 
     if hours:
         parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
@@ -976,9 +1452,9 @@ def format_delta(hours=0, minutes=0, seconds=0):
 def process_day(day, segments: list[dict]):
     output = OUTPUT_DIR / f"GreenDayTV_{day:%Y-%m-%d}.mkv"
 
-    if output.exists():
-        print(f"Daily file already exists: {output}")
-        return
+    # if output.exists():
+        # print(f"Daily file already exists: {output}")
+        # return
 
     day_start = datetime.combine(
         day,
@@ -1008,64 +1484,108 @@ def process_day(day, segments: list[dict]):
     if not day_segments:
         return
 
-    timeline = resolve_overlaps(day_segments)
+    timeline = resolve_overlaps(
+        day_segments,
+        day_start,
+        day_end,
+    )
     reference_media = get_reference_media(timeline)
+    
+    for item in timeline:
+        print(f"{item['kind']}: {item['start']} - {item['end']}")
 
     complete = (
         bool(timeline)
         and timeline[0]["kind"] == "footage"
-        and timeline[0]["start"] <= day_start
         and timeline[-1]["kind"] == "footage"
-        and timeline[-1]["end"] >= day_end
         and not any(item["kind"] == "gap" for item in timeline)
     )
-
+    
+    total_length = sum([(item["end"] - item["start"]).total_seconds() if item["kind"]=="footage" else 0 for item in timeline])
+    missing_footage = (24 * 60 * 60) - total_length
+    print(total_length, missing_footage, total_length/(24 * 60 * 60), missing_footage/(24 * 60 * 60))
+    
     work_dir = OUTPUT_DIR / f".work_{day:%Y-%m-%d}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     parts = []
+    chapter_entries = []
     previous_end = day_start
     clip_index = 1
 
     try:
-        if not complete:
+        if not complete and missing_footage >= DAY_INCOMPLETE_GAP_THRESHOLD:
             warning = work_dir / "000_warning.mkv"
+            delta = timedelta(seconds=missing_footage)
+            print(delta)
             make_notice(
-                "The archived footage for this day is incomplete",
+                f"The archived footage for this day is incomplete.\n({format_delta(delta=delta)} of footage are missing)",
                 warning,
                 reference_media,
             )
             parts.append(warning)
 
-        for item in timeline:
+        for index, item in enumerate(timeline):
             if item["kind"] == "gap":
                 gap_start = item["start"]
                 gap_end = item["end"]
                 gap_seconds = (gap_end - gap_start).total_seconds()
 
-                if gap_seconds >= SIGNIFICANT_GAP:
-                    hours = int(gap_seconds // 3600)
-                    minutes = int((gap_seconds % 3600) // 60)
-                    seconds = int(gap_seconds % 60)
+                hours = int(gap_seconds // 3600)
+                minutes = int((gap_seconds % 3600) // 60)
+                seconds = int(gap_seconds % 60)
 
-                    notice = work_dir / f"{clip_index:04d}_notice.mkv"
+                notice = work_dir / f"{clip_index:04d}_notice.mkv"
 
-                    if previous_end <= day_start:
-                        prefix = "The first captured footage"
-                    else:
-                        prefix = "The next captured footage"
+                # --------------------------------------------------------
+                # Trailing gap:
+                #
+                # There is no captured footage after gap_start until the
+                # end of the day.
+                # --------------------------------------------------------
+
+                if gap_end == day_end:
+                    text = (
+                        f"No captured footage is available after "
+                        f"{format_time(gap_start)}.\n"
+                        f"({format_delta(hours, minutes, seconds)} gap until "
+                        f"the end of the day)"
+                    )
+
+                # --------------------------------------------------------
+                # Leading or Internal gap:
+                #
+                # There is more footage after this gap.
+                # --------------------------------------------------------
+
+                else:
+                    next_item = timeline[index + 1]
+
+                    if next_item["kind"] != "footage":
+                        raise RuntimeError(
+                            "Leading or internal gap is not followed by footage: "
+                            f"{item}"
+                        )
+
+                    next_footage_start = next_item["run_start"]
+                    next_footage_end = next_item["run_end"]
 
                     text = (
-                        f"{prefix} starts at {format_time(gap_end)}.\n"
-                        f"({format_delta(hours, minutes, seconds)} gap)"
+                        f"The next captured footage starts at "
+                        f"{format_time(next_footage_start)} "
+                        f"and ends at "
+                        f"{format_time(next_footage_end)}.\n"
+                        f"({format_delta(hours, minutes, seconds)} gap since the "
+                        f"{'start of the day' if gap_start == day_start else 'previous clip'})."
                     )
 
-                    make_notice(
-                        text,
-                        notice,
-                        reference_media,
-                    )
-                    parts.append(notice)
+                make_notice(
+                    text,
+                    notice,
+                    reference_media,
+                )
+                parts.append(notice)
+                chapter_entries.append(("NOTICE", NOTICE_DURATION))
 
                 previous_end = gap_end
                 clip_index += 1
@@ -1095,19 +1615,42 @@ def process_day(day, segments: list[dict]):
                 print("making edited part")
                 make_ffmpeg_part(item, footage)
                 parts.append(footage)
+                
+                chapter_entries.append((
+                    (
+                        f"Footage: "
+                        f"{item['start']:%H:%M:%S} "
+                        f"to "
+                        f"{item['end']:%H:%M:%S}"
+                    ),
+                    
+                    (item["end"] - item["start"]).total_seconds(),
+                ))
+                
             else:
                 print("using original footage")
                 parts.append(item["path"])
+                chapter_entries.append(
+                    (
+                        (
+                            f"Footage: "
+                            f"{item['start']:%H:%M:%S} "
+                            f"to "
+                            f"{item['end']:%H:%M:%S}"
+                        ),
+                        (item["end"] - item["start"]).total_seconds(),
+                )
+)
 
             previous_end = item["end"]
             clip_index += 1
+
 
         if parts:
             concat_parts(
                 parts,
                 output,
-                work_dir,
-                reference_media,
+                chapter_entries,
             )
         else:
             print(f"No usable footage for {day}")
@@ -1122,17 +1665,20 @@ def process_day(day, segments: list[dict]):
             pass
 
 
-def main():
+def main(local_timezone=None, non_interactive=None):
+    if non_interactive is None:
+        non_interactive = False
+        
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     today = datetime.now(timezone.utc).date() # Convert today to UTC: every time(-zone)-related operation should always use UTC.
-    source_segments = get_source_segments()
+    source_segments = get_source_segments(local_timezone=local_timezone, non_interactive=non_interactive)
     days = build_day_segments(source_segments)
 
     print("Segments for each day:", end="")
 
     for day, segments in sorted(days.items()):
-        print("\n", day, len(segments), end="")
+        print("\n", day, len(segments), "(today, skipping)" if day >= today else "", end="")
 
         for segment in segments:
             print("\n", segment["path"], (segment["end"] - segment["start"]).total_seconds(), end="")
@@ -1146,4 +1692,37 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from argparse import ArgumentParser
+    
+    parser = ArgumentParser(
+                prog='Green Day TV Archiver - Uploader',
+                description=(
+                    'This is the second component of the GDTV Archiver. '
+                    'It stitches (by default, hourly) MKV `source files` into MKV `daily files`.'
+                    )
+            )
+            
+    parser.add_argument(
+        '-t', '--local-timezone',
+        type=str,
+        required=False,
+        default="",
+        help=(
+            "You local timezone in IANA format: "
+            "'Continent/City', in English, replcaing spaces with '_'. "
+            "Examples: 'America/Los_Angeles', 'Europe/London', 'Asia/Tokyo'."
+        )
+    ) 
+    parser.add_argument(
+        '-q', '--non-interactive',
+        action="store_true",
+        help=(
+            f"When passed, the script won't ask for the user's local timezone when needed. "
+            f"If you pass this, please provide '-t' argument and/or create a config file at '{LEGACY_TIMEZONE_CONFIG}'; "
+            f"otherwise the script will terminate with a RuntimeError."
+        )
+    )
+    
+    args = parser.parse_args()
+    
+    main(args.local_timezone, args.non_interactive)
