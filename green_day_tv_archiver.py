@@ -109,9 +109,7 @@ SOURCE_STALL_SECONDS = 60
 # ------------------------------------------------------------
 
 BUFFER_MAX_BYTES = 256 * 1024 * 1024
-
 BUFFER_CHUNK_SIZE = 256 * 1024
-
 BUFFER_LOG_INTERVAL_SECONDS = 30
 
 
@@ -119,11 +117,9 @@ BUFFER_LOG_INTERVAL_SECONDS = 30
 # Finalizer
 # ------------------------------------------------------------
 
-FINALIZE_MIN_AGE_SECONDS = 15 * 60
-
+FINALIZE_MIN_AGE_SECONDS = 120
 FINALIZER_SCAN_INTERVAL = 30.0
-
-FINALIZER_STABLE_DELAY = 1.0
+FINALIZER_STABLE_DELAY = 2.0
 
 FINALIZE_TEMP_SUFFIX = ".finalizing.mkv"
 
@@ -714,10 +710,8 @@ def finalise_segment(
 
         try:
 
-            if (
-                path.resolve()
-                == active.resolve()
-            ):
+            if path.resolve() == active.resolve():
+
                 return
 
         except FileNotFoundError:
@@ -725,9 +719,16 @@ def finalise_segment(
             return
 
     if not is_old_enough(path):
+
         return
 
     if not is_file_stable(path):
+
+        log.info(
+            "Segment is still changing: %s",
+            path.name,
+        )
+
         return
 
     output = utc_output_path(path)
@@ -735,199 +736,55 @@ def finalise_segment(
     # --------------------------------------------------------
     # Already finalized.
     #
-    # Do not remux again. Just remove the old source if possible.
+    # If the destination exists, do NOT overwrite it.
+    # The local file is redundant only if we are certain the
+    # destination is the corresponding completed segment.
     # --------------------------------------------------------
 
     if output.exists():
 
-        try:
-
-            path.unlink()
-
-            log.info(
-                "Removed duplicate local segment: %s",
-                path.name,
-            )
-
-        except PermissionError:
-
-            log.warning(
-                "Final file already exists but "
-                "source is still locked: %s",
-                path.name,
-            )
-
-        return
-
-    temporary_output = (
-        output.with_suffix(
-            output.suffix
-            + FINALIZE_TEMP_SUFFIX
-        )
-    )
-
-    try:
-
-        if temporary_output.exists():
-
-            try:
-
-                temporary_output.unlink()
-
-            except PermissionError:
-
-                return
-
-        local_dt = parse_local_timestamp(
-            path
-        )
-
-        utc_dt = local_dt.astimezone(
-            timezone.utc
-        )
-
-        comment = (
-            "Green Day TV archive segment; "
-            f"source local time "
-            f"{local_dt.isoformat()}; "
-            f"UTC start "
-            f"{utc_dt.isoformat()}"
-        )
-
-        command = [
-
-            FFMPEG,
-
-            "-hide_banner",
-            "-loglevel", "warning",
-            "-nostdin",
-            "-y",
-
-            "-i",
-            str(path),
-
-            "-map", "0",
-
-            "-c", "copy",
-
-            "-metadata",
-            f"comment={comment}",
-
-            "-metadata",
-            (
-                "creation_time="
-                f"{utc_dt.isoformat()}"
-            ),
-
-            str(temporary_output),
-        ]
-
-        log.info(
-            "Finalizing %s -> %s",
+        log.warning(
+            "Final destination already exists; "
+            "leaving local source untouched: %s -> %s",
             path.name,
             output.name,
         )
 
-        result = subprocess.run(
-            command,
+        return
 
-            stdin=subprocess.DEVNULL,
+    try:
 
-            stdout=subprocess.DEVNULL,
-
-            stderr=subprocess.PIPE,
-
-            text=True,
-
-            encoding="utf-8",
-
-            errors="replace",
-
-            creationflags=(
-                get_process_creation_flags(
-                    "below"
-                )
-            ),
+        log.info(
+            "Finalizing by rename: %s -> %s",
+            path.name,
+            output.name,
         )
 
-        if result.returncode != 0:
+        path.replace(output)
 
-            log.warning(
-                "Finalization failed for %s "
-                "(FFmpeg exit %s): %s",
-                path.name,
-                result.returncode,
-                result.stderr.strip(),
-            )
-
-            temporary_output.unlink(
-                missing_ok=True
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # The final output is complete.
-        #
-        # Rename it FIRST.
-        #
-        # Deleting the source is only housekeeping and must
-        # never destroy an already successful final output.
-        # ----------------------------------------------------
-
-        temporary_output.replace(
-            output
+        log.info(
+            "Finalized successfully: %s",
+            output.name,
         )
 
-        try:
+    except PermissionError:
 
-            path.unlink()
-
-            log.info(
-                "Finalized successfully: %s",
-                output.name,
-            )
-
-        except PermissionError:
-
-            log.warning(
-                "Finalized successfully but "
-                "source is still locked; "
-                "it will be removed on a later scan: %s",
-                path.name,
-            )
+        log.info(
+            "Segment is still locked; will retry: %s",
+            path.name,
+        )
 
     except FileNotFoundError:
 
         return
 
-    except PermissionError as exc:
-
-        log.warning(
-            "File temporarily locked while "
-            "finalizing %s: %s",
-            path.name,
-            exc,
-        )
-
-        try:
-
-            temporary_output.unlink(
-                missing_ok=True
-            )
-
-        except PermissionError:
-            pass
-
     except Exception:
 
         log.exception(
-            "Unexpected finalization error "
-            "for %s",
+            "Unexpected finalization error for %s",
             path.name,
         )
-
-
+        
 def segment_finalizer_loop() -> None:
 
     log.info(
@@ -951,20 +808,29 @@ def segment_finalizer_loop() -> None:
                 key=lambda p: p.stat().st_mtime,
             )
 
-            # Only one file per scan.
+            eligible = [
+                p
+                for p in paths
+                if is_old_enough(p)
+            ]
+
+            if eligible:
+
+                log.info(
+                    "Finalizer found %s eligible local segment(s).",
+                    len(eligible),
+                )
+
+            # Process every eligible file.
             #
-            # The live recorder always gets priority.
-            for path in paths:
+            # One problematic file must never prevent newer
+            # segments from being finalized.
+            for path in eligible:
 
                 if SHUTDOWN_EVENT.is_set():
                     break
 
-                if not is_old_enough(path):
-                    continue
-
                 finalise_segment(path)
-
-                break
 
         except Exception:
 
@@ -979,7 +845,6 @@ def segment_finalizer_loop() -> None:
     log.info(
         "Segment finalizer thread stopped."
     )
-
 
 # ============================================================
 # yt-dlp stderr
