@@ -44,9 +44,9 @@ IA_CREDENTIALS_FILE = Path(
 UPLOAD_RETRIES = 3
 
 # Seconds to wait after an upload to let the IA server update.
-# Default is 10 minutes (10 minutes * 60 seconds)
-# Please do not set this any lower than 8 minutes
-SERVE_UPDATE_DELAY = 10 * 60
+# Default is 12 minutes (12 minutes * 60 seconds)
+# Please do not set this any lower than 10 minutes
+SERVE_UPDATE_DELAY = 12 * 60
 
 # Seconds to wait between upload retries.
 UPLOAD_RETRY_DELAY = 30
@@ -288,7 +288,7 @@ def upload_day(
                     
         except Exception as exc:
             print(
-                f"Upload raised an exception: "
+                f"\nUpload raised an exception: "
                 f"{type(exc).__name__}: {exc}"
             )
 
@@ -360,7 +360,8 @@ def main(access_key=None, secret_key=None):
             
             # if SOURCE_DIR is of type pathlib.Path then delete all of the source files for the now uploaded day in that path.
             if type(SOURCE_DIR).__name__ == Path.__name__:
-                for file in SOURCE_DIR.glob(f"*{date_string}.mkv"):
+                for file in SOURCE_DIR.glob(f"*{date_string}_*.mkv"):
+                    if "finalising" in file.name or "local" in file.name: continue
                     path.unlink()
 
     # --------------------------------------------------------
