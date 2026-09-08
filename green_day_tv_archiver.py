@@ -1813,4 +1813,15 @@ def main() -> None:
 # ============================================================
 
 if __name__ == "__main__":
+    from argparse import ArgumentParser
+    
+    parser = ArgumentParser(
+                prog='Green Day TV Archiver - Archiver',
+                description=(
+                    'This is the first component of the GDTV Archiver. '
+                    'It runs a deamon in the background active 24/7 archiving the GDTV stream.'
+                    'It saves everything in (by default, hourly) MKV files called `source segments`.'
+                    'It uses a memory buffer (default: 256MB) to always stay in sync with the stream'.
+                    )
+            )
     main()
