@@ -137,7 +137,8 @@ def get_daily_files():
 def get_identifier(date_string: str, must_be_new: bool = False):
     base_identifier = f"{IA_IDENTIFIER_PREFIX}-{date_string}"
     if must_be_new:
-        available = get_item(base_identifier).identifier_available()
+        identifier = base_identifier
+        available = get_item(identifier).identifier_available()
         
         count = 0
         while not available:
@@ -237,6 +238,7 @@ def upload_day(
 
         try:
             identifier = get_identifier(date_string, True) # Now we are trying to upload. The identifier MUST be new.
+            print(identifier)
             item = get_item(identifier) # Refresh `item` to the new identifier.
             
             responses = item.upload(
@@ -333,8 +335,6 @@ def main(access_key=None, secret_key=None):
     # --------------------------------------------------------
     # Load credentials
     # --------------------------------------------------------
-    
-    print(access_key, secret_key)
 
     if not (access_key or secret_key):
         access_key, secret_key = (load_ia_credentials())
