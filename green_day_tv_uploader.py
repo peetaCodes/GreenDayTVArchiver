@@ -134,8 +134,19 @@ def get_daily_files():
 # Internet Archive identifier
 # ------------------------------------------------------------
 
-def get_identifier(date_string: str):
-    return f"{IA_IDENTIFIER_PREFIX}-{date_string}"
+def get_identifier(date_string: str, must_be_new: bool = False):
+    base_identifier = f"{IA_IDENTIFIER_PREFIX}-{date_string}"
+    if must_be_new:
+        available = get_item(base_identifier).identifier_available()
+        
+        count = 0
+        while not available:
+            count += 1
+            identifier = f"{base_identifier}_{chr(count + 96)}" # if count == 1: add '_a' (Unicode 97), if count == 2: add '_b' (Unicode 98)...
+            available = get_item(identifier).identifier_available()
+            
+        return identifier
+    return base_identifier
 
 
 # ------------------------------------------------------------
@@ -225,6 +236,9 @@ def upload_day(
         print(f"Starting upload (attempt {attempt}/{UPLOAD_RETRIES})...")
 
         try:
+            identifier = get_identifier(date_string, True) # Now we are trying to upload. The identifier MUST be new.
+            item = get_item(identifier) # Refresh `item` to the new identifier.
+            
             responses = item.upload(
 
                 files=[str(path)],
